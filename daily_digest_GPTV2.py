@@ -56,6 +56,21 @@ HEADERS = {
 # Cache for OpenAlex journal IDs
 JOURNAL_ID_CACHE = {}
 
+# Allowed categories for AI classification
+ALLOWED_CATEGORIES = [
+    "Comminution",
+    "Flotation",
+    "Hydrometallurgy",
+    "Pyrometallurgy",
+    "Geometallurgy & Ore Characterisation",
+    "Mineral Processing Modelling & Simulation",
+    "Automation & Control",
+    "Data Science & AI",
+    "ESG & Sustainability",
+    "Equipment & Operations",
+    "Other",
+]
+
 
 def truncate_text(text: str, max_chars: int = 800) -> str:
     """Truncate long text to avoid huge prompts while preserving meaning."""
@@ -225,18 +240,66 @@ def fetch_rss_feeds(sources_df: pd.DataFrame):
     return news_items
 
 
+def normalize_category(cat: str) -> str:
+    """Map model output category to one of the allowed categories, or 'Other'."""
+    if not isinstance(cat, str):
+        return "Other"
+    cat = cat.strip()
+    if cat in ALLOWED_CATEGORIES:
+        return cat
+
+    low = cat.lower()
+    if "comminut" in low or "grinding" in low or "crushing" in low:
+        return "Comminution"
+    if "flotation" in low:
+        return "Flotation"
+    if "hydromet" in low or "leach" in low:
+        return "Hydrometallurgy"
+    if "pyromet" in low or "smelt" in low or "roast" in low:
+        return "Pyrometallurgy"
+    if "geomet" in low or "ore character" in low:
+        return "Geometallurgy & Ore Characterisation"
+    if "model" in low or "simulation" in low:
+        return "Mineral Processing Modelling & Simulation"
+    if "control" in low or "automation" in low:
+        return "Automation & Control"
+    if "ai" in low or "machine learning" in low or "data" in low:
+        return "Data Science & AI"
+    if (
+        "esg" in low
+        or "sustainab" in low
+        or "rehabilitation" in low
+        or "tailings" in low
+    ):
+        return "ESG & Sustainability"
+    if "equipment" in low or "operation" in low or "plant" in low:
+        return "Equipment & Operations"
+
+    return "Other"
+
+
+def parse_priority(raw: str) -> str:
+    """Extract a digit (1 or 2) from the priority field; default to '2'."""
+    if not isinstance(raw, str):
+        return "2"
+    for ch in raw:
+        if ch.isdigit():
+            return ch
+    return "2"
+
+
 def summarize_with_ai(items, keywords_context, batch_size: int = 3):
     """
     Use Gemini to annotate items in batches.
 
-    We NO LONGER gate on relevance; assume all items are at least somewhat relevant.
-    The model's job is to:
-      - assign Category,
-      - assign Priority (1 = must read, 2 = worth scanning),
-      - generate a Highlight.
+    - Assumes all items are at least somewhat relevant.
+    - For each item, Gemini outputs: INDEX | Category | Priority | Highlight
+    - We validate the structure and retry once if Gemini gives us junk.
 
-    Expected line format per item:
-      INDEX | Category | Priority | Highlight
+    Parsing rules:
+    - Only lines with >= 4 '|' segments are considered.
+    - We ignore the INDEX for mapping and assign valid lines to items in order.
+    - Missing lines/items fall back to defaults (topic, priority, highlight).
     """
     if not items:
         print("[AI] No items to analyse.")
@@ -245,8 +308,8 @@ def summarize_with_ai(items, keywords_context, batch_size: int = 3):
     print(f"\n[STEP] Analysing {len(items)} items with Gemini (batched)...")
     annotated_items = []
     interests = ", ".join(keywords_context.values())
+    MAX_RETRIES = 2
 
-    # Helper to chunk the list
     def chunk_list(seq, size):
         for i in range(0, len(seq), size):
             yield seq[i : i + size]
@@ -317,70 +380,56 @@ Now process the following items:
 {items_block}
 """
 
-        try:
-            response = model.generate_content(prompt)
-            text = response.text.strip()
-            print(f"[AI] Raw batch response:\n{text}\n")
+        attempt = 0
+        parsed_result_for_batch = None
 
-            lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
-            if len(lines) != len(batch):
-                print(
-                    f"[AI] WARNING: Expected {len(batch)} lines, but got {len(lines)}. "
-                    "Some items may fall back to default metadata."
-                )
+        while attempt < MAX_RETRIES and parsed_result_for_batch is None:
+            attempt += 1
+            print(f"[AI] Calling Gemini for batch {batch_number}, attempt {attempt}...")
 
-            # Build a map from index -> parsed fields
-            parsed_by_index = {}
+            try:
+                response = model.generate_content(prompt)
+                text = response.text.strip()
+                print(f"[AI] Raw batch response (attempt {attempt}):\n{text}\n")
 
-            for line in lines:
-                parts = [p.strip() for p in line.split("|")]
-                if len(parts) < 4:
-                    print(f"[AI] Malformed line, skipping: {line}")
-                    continue
+                lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
 
-                index_str, category, priority, highlight = parts[:4]
+                # Collect only lines that look structurally valid
+                valid_lines = []
+                for ln in lines:
+                    parts = [p.strip() for p in ln.split("|")]
+                    if len(parts) >= 4:
+                        valid_lines.append(parts)
 
-                try:
-                    item_index = int(index_str)
-                    if not (1 <= item_index <= len(batch)):
-                        print(
-                            f"[AI] Invalid index {item_index} for batch, skipping line."
-                        )
-                        continue
-                except ValueError:
-                    print(f"[AI] Invalid index '{index_str}', skipping line.")
-                    continue
-
-                parsed_by_index[item_index] = {
-                    "category": category,
-                    "priority": priority,
-                    "highlight": highlight,
-                }
-
-            # Apply parsed annotations back to items
-            for idx, item in enumerate(batch, start=1):
-                ann = parsed_by_index.get(idx, None)
-                if ann:
-                    item["topic"] = ann["category"]
-                    item["priority"] = ann["priority"]
-                    item["highlight"] = ann["highlight"]
-                else:
-                    # Fallback defaults if AI did not return a line for this item
-                    item.setdefault("topic", item.get("topic", "General"))
-                    item.setdefault("priority", "2")
-                    item.setdefault(
-                        "highlight",
-                        truncate_text(item.get("abstract", ""), max_chars=200),
+                if len(valid_lines) == 0:
+                    print(
+                        f"[AI] No valid structured lines parsed for batch {batch_number} "
+                        f"on attempt {attempt}."
                     )
-                annotated_items.append(item)
+                    if attempt < MAX_RETRIES:
+                        print("[AI] Retrying after short delay...")
+                        time.sleep(5)
+                        continue
+                    else:
+                        print("[AI] Max retries reached, falling back for this batch.")
+                        break
 
-        except Exception as e:
-            print(f"[AI] Error on batch {batch_number}: {e}")
-            if "429" in str(e):
-                print("[AI] Hit rate limit, sleeping 60 seconds...")
-                time.sleep(60)
+                parsed_result_for_batch = valid_lines
 
-            # If the batch fails completely, fall back for all items
+            except Exception as e:
+                print(f"[AI] Error on batch {batch_number}, attempt {attempt}: {e}")
+                if "429" in str(e):
+                    print("[AI] Hit rate limit, sleeping 60 seconds...")
+                    time.sleep(60)
+                if attempt >= MAX_RETRIES:
+                    print("[AI] Max retries reached for this batch; using fallback.")
+                    break
+                else:
+                    print("[AI] Will retry this batch...")
+                    time.sleep(5)
+
+        if parsed_result_for_batch is None:
+            # Total failure for this batch -> fallback for all items
             for item in batch:
                 item.setdefault("topic", item.get("topic", "General"))
                 item.setdefault("priority", "2")
@@ -389,8 +438,39 @@ Now process the following items:
                     truncate_text(item.get("abstract", ""), max_chars=200),
                 )
                 annotated_items.append(item)
+            continue
 
-        # Gentle pacing between batches (reduces rate-limit risk)
+        # At this point parsed_result_for_batch is a list of [INDEX, Category, Priority, Highlight, ...]
+        valid_lines = parsed_result_for_batch
+        if len(valid_lines) < len(batch):
+            print(
+                f"[AI] WARNING: Expected {len(batch)} structured lines, "
+                f"but only parsed {len(valid_lines)}. "
+                "Remaining items in the batch will use fallback metadata."
+            )
+
+        # Map valid lines to items in order, ignoring the index field
+        for idx, item in enumerate(batch):
+            if idx < len(valid_lines):
+                parts = valid_lines[idx]
+                _, raw_cat, raw_pri, raw_highlight = parts[:4]
+                category = normalize_category(raw_cat)
+                priority = parse_priority(raw_pri)
+                highlight = raw_highlight.strip() or truncate_text(
+                    item.get("abstract", ""), max_chars=200
+                )
+                item["topic"] = category
+                item["priority"] = priority
+                item["highlight"] = highlight
+            else:
+                item.setdefault("topic", item.get("topic", "General"))
+                item.setdefault("priority", "2")
+                item.setdefault(
+                    "highlight",
+                    truncate_text(item.get("abstract", ""), max_chars=200),
+                )
+            annotated_items.append(item)
+
         time.sleep(3)
 
     print(f"\n[AI] Total items annotated across all batches: {len(annotated_items)}")
@@ -417,11 +497,16 @@ def generate_journal_summaries(items):
         n_must = sum(1 for p in priorities if p.startswith("1"))
         n_scan = n_total - n_must
 
-        categories = [it.get("topic", "General") for it in j_items]
-        cat_counts = Counter(categories)
-        # Most common up to 3
-        top_cats = [c for c, _ in cat_counts.most_common(3)]
-        if top_cats:
+        raw_categories = [it.get("topic", "General") for it in j_items]
+        categories = [
+            c
+            for c in raw_categories
+            if c not in ("General", "Other", "Journal Watch", "Industry News")
+        ]
+
+        if categories:
+            cat_counts = Counter(categories)
+            top_cats = [c for c, _ in cat_counts.most_common(3)]
             if len(top_cats) == 1:
                 cat_str = top_cats[0]
             elif len(top_cats) == 2:
@@ -430,7 +515,7 @@ def generate_journal_summaries(items):
                 cat_str = f"{top_cats[0]}, {top_cats[1]} and {top_cats[2]}"
             theme_sentence = f"Main themes this period are {cat_str}."
         else:
-            theme_sentence = "The themes are mixed this period."
+            theme_sentence = "Themes are diverse this period."
 
         summary = (
             f"{theme_sentence} The digest includes {n_total} papers from {journal}, "
@@ -447,7 +532,6 @@ def build_newsletter_html(items, review_stats, journal_summaries):
     start_str = review_stats["start_date"]
 
     if not items:
-        # Minimal skeleton when no items or no relevant items
         return f"""
 <html>
   <body style="font-family: Arial, sans-serif; color: #333;">
@@ -467,13 +551,11 @@ def build_newsletter_html(items, review_stats, journal_summaries):
 
     df = pd.DataFrame(items)
 
-    # Default values if missing
     if "topic" not in df.columns:
         df["topic"] = "General"
     if "priority" not in df.columns:
-        df["priority"] = "2"  # treat as 'worth scanning'
+        df["priority"] = "2"
 
-    # Sort by topic then priority (1 before 2)
     df["priority_num"] = (
         df["priority"].astype(str).str.extract("(\d)").fillna("2").astype(int)
     )
@@ -483,7 +565,6 @@ def build_newsletter_html(items, review_stats, journal_summaries):
     total_annotated = len(items)
     per_source = review_stats["per_source"]
 
-    # Build coverage and source stats block
     sources_html_lines = []
     for src, stats in per_source.items():
         sources_html_lines.append(
@@ -491,7 +572,6 @@ def build_newsletter_html(items, review_stats, journal_summaries):
         )
     sources_html = "\n".join(sources_html_lines)
 
-    # Journal summaries block
     journal_summaries_html_lines = []
     for journal, summary in journal_summaries.items():
         journal_summaries_html_lines.append(
@@ -610,17 +690,14 @@ def send_email(html: str):
 
 
 if __name__ == "__main__":
-    # Basic file existence checks
     if not os.path.exists("keywords.csv") or not os.path.exists("sources.csv"):
         print("Error: keywords.csv or sources.csv not found in the project folder.")
         raise SystemExit(1)
 
-    # Load configs
     keywords_df = pd.read_csv("keywords.csv")
     sources_df = pd.read_csv("sources.csv")
     keywords_context = dict(zip(keywords_df.topic, keywords_df.keywords))
 
-    # Define review window explicitly
     today = datetime.date.today()
     start_date = today - datetime.timedelta(days=LOOKBACK_DAYS)
 
@@ -631,7 +708,6 @@ if __name__ == "__main__":
     all_raw_items = journal_papers + rss_news
     print(f"\n[INFO] Total raw items collected: {len(all_raw_items)}")
 
-    # Build raw stats
     source_counts_raw = Counter(it.get("source", "Unknown") for it in all_raw_items)
 
     if not all_raw_items:
@@ -647,10 +723,8 @@ if __name__ == "__main__":
         send_email(html)
         raise SystemExit(0)
 
-    # Use AI to annotate and prioritise (no more hard Yes/No gating)
     annotated_items = summarize_with_ai(all_raw_items, keywords_context, batch_size=3)
 
-    # Build stats for annotated items
     source_counts_annotated = Counter(
         it.get("source", "Unknown") for it in annotated_items
     )
@@ -668,10 +742,8 @@ if __name__ == "__main__":
         "per_source": per_source_stats,
     }
 
-    # Generate per-journal summaries based on annotated items (deterministic)
     journal_summaries = generate_journal_summaries(annotated_items)
 
-    # Build, save, and send newsletter
     html = build_newsletter_html(annotated_items, review_stats, journal_summaries)
     save_html(html)
     send_email(html)
