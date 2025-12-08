@@ -1,7 +1,7 @@
 name,type,identifier
-"Minerals (MDPI)",rss,https://www.mdpi.com/rss/journal/minerals
-"Metals (MDPI)",rss,https://www.mdpi.com/rss/journal/metals
-"SAIMM Journal",rss,https://www.saimm.co.za/journal-papers?format=feed&type=rss
+"Minerals (MDPI)",journal,"Minerals"
+"Metals (MDPI)",journal,"Metals"
+"SAIMM Journal",journal,"Journal of the Southern African Institute of Mining and Metallurgy"
 "Nature Geoscience",journal,"Nature Geoscience"
 "Nature Communications",journal,"Nature Communications"
 "Minerals Engineering",journal,"Minerals Engineering"
@@ -20,3 +20,11 @@ name,type,identifier
 "Canadian Metallurgical Quarterly",journal,"Canadian Metallurgical Quarterly"
 "IEEE Transactions on Industry Applications",journal,"IEEE Transactions on Industry Applications"
 "International Journal of Rock Mechanics",journal,"International Journal of Rock Mechanics and Mining Sciences"
+"SME Annual Conference",journal,"SME Annual Conference"
+"CIM Journal",journal,"CIM Journal"
+"Mining Engineering (SME)",journal,"Mining Engineering"
+"AusIMM Bulletin",journal,"AusIMM Bulletin"
+"Iron Ore Conference",journal,"Iron Ore"
+"International Mineral Processing Congress",journal,"International Mineral Processing Congress"
+"World Gold Conference",journal,"World Gold"
+"Copper International Conference",journal,"Copper International Conference"

@@ -1,0 +1,5 @@
+{
+  "lookback_days": 7,
+  "max_items_per_feed": 5,
+  "email_subject": "Weekly Mining & Processing Digest"
+}
