@@ -58,7 +58,7 @@ JOURNAL_ID_CACHE = {}
 
 
 def truncate_text(text: str, max_chars: int = 800) -> str:
-    """Truncate long text to avoid huge prompts."""
+    """Truncate long text to avoid huge prompts while preserving meaning."""
     if not isinstance(text, str):
         return ""
     text = text.strip()
@@ -266,31 +266,54 @@ def summarize_with_ai(items, keywords_context, batch_size: int = 3):
         items_block = "\n\n".join(items_text_lines)
 
         prompt = f"""
-You are a Mining & Mineral Processing Research Assistant.
+You are an expert research assistant in mining, mineral processing, and the resources industry.
 
-My technical interests: {interests}.
+My current technical interests are:
+{interests}
 
-Below is a batch of {len(batch)} candidate items (papers or news). For EACH item:
+You will receive a batch of {len(batch)} candidate items (papers or news). For EACH item, you must:
+- Assume it is at least somewhat relevant to my interests (do NOT reject or skip any item).
+- Assign a CATEGORY from this list (choose the closest match):
+  - Comminution
+  - Flotation
+  - Hydrometallurgy
+  - Pyrometallurgy
+  - Geometallurgy & Ore Characterisation
+  - Mineral Processing Modelling & Simulation
+  - Automation & Control
+  - Data Science & AI
+  - ESG & Sustainability
+  - Equipment & Operations
+  - Other
 
-1. Assume it is at least somewhat relevant to my interests.
-2. Assign a CATEGORY (short label, e.g., Comminution, Flotation, Hydrometallurgy, Automation, ESG).
-3. Assign PRIORITY:
-   - 1 = must-read (highly central or novel for those interests),
-   - 2 = worth scanning (contextual, incremental or less central).
-4. Write a single-sentence HIGHLIGHT summarising the key idea or contribution.
+- Assign a PRIORITY:
+  - 1 = must-read (highly central to the interests above, conceptually novel, or practically important)
+  - 2 = worth scanning (supporting, incremental, or more peripheral, but still relevant)
 
-Return EXACTLY ONE LINE PER ITEM, in the same order, with this format:
+- Write a one-sentence HIGHLIGHT capturing the main idea, contribution, or finding.
+  - The highlight must be understandable in isolation.
+  - Do NOT just repeat the title.
 
-INDEX | Category | Priority | Highlight
+OUTPUT RULES (very important):
+- You MUST return EXACTLY one line per item.
+- You MUST keep the original order of items (1, 2, 3, ...).
+- You MUST NOT add any commentary before, between, or after the lines.
+- Each line MUST have this exact format:
+
+  INDEX | Category | Priority | Highlight
 
 Where:
-- INDEX is the item number I gave you (1, 2, 3, ...),
-- Category is a short label,
-- Priority is 1 or 2,
+- INDEX is the item number I gave you (1, 2, 3, ...).
+- Category is one of the labels listed above.
+- Priority is 1 or 2.
 - Highlight is one sentence.
 
-Do NOT skip any items. Do NOT add extra commentary.
-Items:
+Example of valid output for 2 items:
+1 | Flotation | 1 | This paper proposes a new reagent strategy that significantly improves rougher recovery in complex sulphide ores.
+2 | Automation & Control | 2 | The article describes a case study of implementing model predictive control to stabilise a grinding circuit under variable feed conditions.
+
+Now process the following items:
+
 {items_block}
 """
 
@@ -400,12 +423,20 @@ def generate_journal_summaries(items):
 You are summarising recent publications in the journal '{journal}' 
 for a mining & mineral processing researcher.
 
-Here are some recent papers (title + one-sentence highlight):
+Here are some recent papers from this journal (each with title and a short highlight):
 
 {block}
 
-In 2–3 sentences, summarise the main technical themes and trends represented
-by these papers, using plain, concise language.
+Write a concise overview of the main technical themes and trends represented by these papers.
+
+Requirements:
+- Length: 2–3 sentences total.
+- Focus on themes and trends (e.g., focus areas, methods, types of ore, process challenges).
+- Do NOT list individual paper titles.
+- Do NOT use bullet points or numbered lists.
+- Write in plain, professional, neutral language.
+
+Now provide the 2–3 sentence summary.
 """
 
         try:
@@ -422,7 +453,7 @@ by these papers, using plain, concise language.
 
 
 def build_newsletter_html(items, review_stats, journal_summaries):
-    """Build grouped HTML newsletter from selected items."""
+    """Build grouped HTML newsletter from annotated items."""
     today_str = review_stats["end_date"]
     start_str = review_stats["start_date"]
 
@@ -573,7 +604,7 @@ def send_email(html: str):
         return
 
     import smtplib
-    from email.mime_text import MIMEText
+    from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
 
     msg = MIMEMultipart()
