@@ -2,9 +2,9 @@ name: Weekly Mining Digest
 
 on:
   schedule:
-    # Runs every Sunday at 22:00 UTC
-    # Brisbane is UTC+10, so this is Monday 08:00 Brisbane time
-    - cron: '0 22 * * SUN'
+    # Runs every Sunday at 20:00 UTC
+    # Brisbane is UTC+10, so this is Monday 06:00 Brisbane time
+    - cron: '0 20 * * SUN'
   workflow_dispatch:  # allows manual runs from GitHub UI
     {}
 
