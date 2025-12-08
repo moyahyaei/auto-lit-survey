@@ -3,6 +3,7 @@ import json
 import datetime
 import time
 import io
+from collections import Counter, defaultdict
 
 import pandas as pd
 import feedparser
@@ -56,7 +57,7 @@ HEADERS = {
 JOURNAL_ID_CACHE = {}
 
 
-def truncate_text(text: str, max_chars: int = 300) -> str:
+def truncate_text(text: str, max_chars: int = 800) -> str:
     """Truncate long text to avoid huge prompts."""
     if not isinstance(text, str):
         return ""
@@ -107,18 +108,17 @@ def reconstruct_abstract(inverted_index):
     return " ".join(word for _, word in sorted_words)
 
 
-def fetch_openalex_journal_watch(sources_df: pd.DataFrame):
+def fetch_openalex_journal_watch(sources_df: pd.DataFrame, start_date: datetime.date):
     """Fetch recent papers from selected journals via OpenAlex."""
-    print(f"\n[STEP] Querying OpenAlex for last {LOOKBACK_DAYS} days...")
+    print(
+        f"\n[STEP] Querying OpenAlex for last {LOOKBACK_DAYS} days (from {start_date})..."
+    )
     papers = []
 
     journal_rows = sources_df[sources_df["type"] == "journal"]
     if journal_rows.empty:
         print("[OpenAlex] No journals configured in sources.csv.")
         return papers
-
-    today = datetime.date.today()
-    start_date = today - datetime.timedelta(days=LOOKBACK_DAYS)
 
     for _, row in journal_rows.iterrows():
         journal_name = row["identifier"]
@@ -151,7 +151,7 @@ def fetch_openalex_journal_watch(sources_df: pd.DataFrame):
                 abstract_text = reconstruct_abstract(
                     work.get("abstract_inverted_index")
                 )
-                abstract_text = truncate_text(abstract_text, max_chars=300)
+                abstract_text = truncate_text(abstract_text, max_chars=800)
                 url = work.get("doi") or work.get("id") or ""
                 papers.append(
                     {
@@ -207,7 +207,7 @@ def fetch_rss_feeds(sources_df: pd.DataFrame):
                     or entry.get("description")
                     or "No summary provided."
                 )
-                abstract_text = truncate_text(abstract_text, max_chars=300)
+                abstract_text = truncate_text(abstract_text, max_chars=800)
                 news_items.append(
                     {
                         "title": entry.get("title", "No title"),
@@ -227,18 +227,23 @@ def fetch_rss_feeds(sources_df: pd.DataFrame):
 
 def summarize_with_ai(items, keywords_context, batch_size: int = 3):
     """
-    Use Gemini to filter, categorise and highlight items in batches.
+    Use Gemini to annotate items in batches.
 
-    - Sends multiple items in one prompt (reduces API calls and token pressure).
-    - Expects one line of output per item in the batch:
-      INDEX | Yes/No | Category | Priority | Highlight
+    We NO LONGER gate on relevance; assume all items are at least somewhat relevant.
+    The model's job is to:
+      - assign Category,
+      - assign Priority (1 = must read, 2 = worth scanning),
+      - generate a Highlight.
+
+    Expected line format per item:
+      INDEX | Category | Priority | Highlight
     """
     if not items:
         print("[AI] No items to analyse.")
         return []
 
     print(f"\n[STEP] Analysing {len(items)} items with Gemini (batched)...")
-    newsletter_items = []
+    annotated_items = []
     interests = ", ".join(keywords_context.values())
 
     # Helper to chunk the list
@@ -265,24 +270,26 @@ You are a Mining & Mineral Processing Research Assistant.
 
 My technical interests: {interests}.
 
-Below is a batch of {len(batch)} candidate items (papers or news). For each item, decide:
+Below is a batch of {len(batch)} candidate items (papers or news). For EACH item:
 
-1. RELEVANCE: Is this technically significant for my interests? (Yes/No)
-2. CATEGORY: Short category (e.g., Comminution, ESG, Automation, Hydrometallurgy).
-3. PRIORITY: 1 = must-read, 2 = worth scanning.
-4. HIGHLIGHT: One sentence on the core finding/insight.
+1. Assume it is at least somewhat relevant to my interests.
+2. Assign a CATEGORY (short label, e.g., Comminution, Flotation, Hydrometallurgy, Automation, ESG).
+3. Assign PRIORITY:
+   - 1 = must-read (highly central or novel for those interests),
+   - 2 = worth scanning (contextual, incremental or less central).
+4. Write a single-sentence HIGHLIGHT summarising the key idea or contribution.
 
-Return ONE LINE PER ITEM in this exact format:
+Return EXACTLY ONE LINE PER ITEM, in the same order, with this format:
 
-INDEX | Yes/No | Category | Priority | Highlight
+INDEX | Category | Priority | Highlight
 
 Where:
-- INDEX is the item number I gave you (1, 2, 3, ...).
-- Yes/No is your relevance judgement.
-- Category is a short label.
-- Priority is 1 or 2.
-- Highlight is a single sentence.
+- INDEX is the item number I gave you (1, 2, 3, ...),
+- Category is a short label,
+- Priority is 1 or 2,
+- Highlight is one sentence.
 
+Do NOT skip any items. Do NOT add extra commentary.
 Items:
 {items_block}
 """
@@ -293,16 +300,23 @@ Items:
             print(f"[AI] Raw batch response:\n{text}\n")
 
             lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+            if len(lines) != len(batch):
+                print(
+                    f"[AI] WARNING: Expected {len(batch)} lines, but got {len(lines)}. "
+                    "Some items may fall back to default metadata."
+                )
+
+            # Build a map from index -> parsed fields
+            parsed_by_index = {}
+
             for line in lines:
-                # Expected: INDEX | Yes/No | Category | Priority | Highlight
                 parts = [p.strip() for p in line.split("|")]
-                if len(parts) < 5:
+                if len(parts) < 4:
                     print(f"[AI] Malformed line, skipping: {line}")
                     continue
 
-                index_str, yesno, category, priority, highlight = parts[:5]
+                index_str, category, priority, highlight = parts[:4]
 
-                # Map INDEX back to the corresponding item in this batch
                 try:
                     item_index = int(index_str)
                     if not (1 <= item_index <= len(batch)):
@@ -314,15 +328,28 @@ Items:
                     print(f"[AI] Invalid index '{index_str}', skipping line.")
                     continue
 
-                if yesno.lower().startswith("yes"):
-                    original_item = batch[item_index - 1]
-                    original_item["topic"] = category
-                    original_item["priority"] = priority
-                    original_item["highlight"] = highlight
-                    newsletter_items.append(original_item)
-                    print(f"[AI] -> APPROVED (batch item {item_index})")
+                parsed_by_index[item_index] = {
+                    "category": category,
+                    "priority": priority,
+                    "highlight": highlight,
+                }
+
+            # Apply parsed annotations back to items
+            for idx, item in enumerate(batch, start=1):
+                ann = parsed_by_index.get(idx, None)
+                if ann:
+                    item["topic"] = ann["category"]
+                    item["priority"] = ann["priority"]
+                    item["highlight"] = ann["highlight"]
                 else:
-                    print(f"[AI] -> Not relevant (batch item {index_str}), skipped.")
+                    # Fallback defaults if AI did not return a line for this item
+                    item.setdefault("topic", item.get("topic", "General"))
+                    item.setdefault("priority", "2")
+                    item.setdefault(
+                        "highlight",
+                        truncate_text(item.get("abstract", ""), max_chars=200),
+                    )
+                annotated_items.append(item)
 
         except Exception as e:
             print(f"[AI] Error on batch {batch_number}: {e}")
@@ -330,27 +357,86 @@ Items:
                 print("[AI] Hit rate limit, sleeping 60 seconds...")
                 time.sleep(60)
 
+            # If the batch fails completely, fall back for all items
+            for item in batch:
+                item.setdefault("topic", item.get("topic", "General"))
+                item.setdefault("priority", "2")
+                item.setdefault(
+                    "highlight",
+                    truncate_text(item.get("abstract", ""), max_chars=200),
+                )
+                annotated_items.append(item)
+
         # Gentle pacing between batches (reduces rate-limit risk)
         time.sleep(3)
 
-    print(f"\n[AI] Total items approved across all batches: {len(newsletter_items)}")
-    return newsletter_items
+    print(f"\n[AI] Total items annotated across all batches: {len(annotated_items)}")
+    return annotated_items
 
 
-def build_newsletter_html(items):
+def generate_journal_summaries(items):
+    """
+    Generate brief per-journal summaries based on the annotated items.
+
+    Only considers items of type 'Academic'.
+    """
+    print("\n[STEP] Generating per-journal summaries...")
+    journal_items = defaultdict(list)
+    for it in items:
+        if it.get("type") == "Academic":
+            journal_items[it.get("source", "Unknown")].append(it)
+
+    summaries = {}
+    for journal, j_items in journal_items.items():
+        print(f"[AI] Summarising journal: {journal} ({len(j_items)} items)")
+        titles_and_highlights = []
+        for idx, it in enumerate(j_items, start=1):
+            titles_and_highlights.append(
+                f"{idx}. Title: {it.get('title', '')}\n   Highlight: {it.get('highlight', '')}"
+            )
+        block = "\n".join(titles_and_highlights)
+
+        prompt = f"""
+You are summarising recent publications in the journal '{journal}' 
+for a mining & mineral processing researcher.
+
+Here are some recent papers (title + one-sentence highlight):
+
+{block}
+
+In 2–3 sentences, summarise the main technical themes and trends represented
+by these papers, using plain, concise language.
+"""
+
+        try:
+            response = model.generate_content(prompt)
+            text = response.text.strip()
+            summaries[journal] = text
+        except Exception as e:
+            print(f"[AI] Error generating summary for journal {journal}: {e}")
+            summaries[journal] = "Summary unavailable due to an AI error."
+
+        time.sleep(2)
+
+    return summaries
+
+
+def build_newsletter_html(items, review_stats, journal_summaries):
     """Build grouped HTML newsletter from selected items."""
+    today_str = review_stats["end_date"]
+    start_str = review_stats["start_date"]
+
     if not items:
         # Minimal skeleton when no items or no relevant items
-        today_str = datetime.date.today().isoformat()
         return f"""
 <html>
   <body style="font-family: Arial, sans-serif; color: #333;">
     <div style="background-color: #2c3e50; padding: 16px; text-align: center;">
       <h2 style="color: #ecf0f1; margin: 0;">⛏️ Weekly Mining & Processing Digest</h2>
-      <div style="color: #bdc3c7; font-size: 12px;">{today_str}</div>
+      <div style="color: #bdc3c7; font-size: 12px;">Coverage: {start_str} → {today_str}</div>
     </div>
     <div style="padding: 20px;">
-      <p>No new relevant items were identified for this period.</p>
+      <p>No new items were identified for this period.</p>
     </div>
     <div style="text-align: center; font-size: 11px; color: #aaa; padding: 16px;">
       Generated automatically by your Mining Digest agent.
@@ -373,17 +459,55 @@ def build_newsletter_html(items):
     )
     df.sort_values(by=["topic", "priority_num"], inplace=True)
 
-    today_str = datetime.date.today().isoformat()
+    total_raw = review_stats["total_raw"]
+    total_annotated = len(items)
+    per_source = review_stats["per_source"]
+
+    # Build coverage and source stats block
+    sources_html_lines = []
+    for src, stats in per_source.items():
+        sources_html_lines.append(
+            f"<li><b>{src}</b>: {stats['raw']} collected, {stats['annotated']} included</li>"
+        )
+    sources_html = "\n".join(sources_html_lines)
+
+    # Journal summaries block
+    journal_summaries_html_lines = []
+    for journal, summary in journal_summaries.items():
+        journal_summaries_html_lines.append(
+            f"<h4 style='margin-bottom:4px;'>{journal}</h4>"
+            f"<p style='margin-top:0;'>{summary}</p>"
+        )
+    journal_summaries_html = (
+        "\n".join(journal_summaries_html_lines)
+        or "<p>No academic journal items this period.</p>"
+    )
 
     html = f"""
 <html>
   <body style="font-family: Arial, sans-serif; color: #333;">
     <div style="background-color: #2c3e50; padding: 16px; text-align: center;">
       <h2 style="color: #ecf0f1; margin: 0;">⛏️ Weekly Mining & Processing Digest</h2>
-      <div style="color: #bdc3c7; font-size: 12px;">{today_str}</div>
+      <div style="color: #bdc3c7; font-size: 12px;">Coverage: {start_str} → {today_str}</div>
     </div>
     <div style="padding: 20px;">
-      <p>This digest includes AI-filtered publications and news relevant to mining, mineral processing, and the resources industry.</p>
+
+      <h3>Overview</h3>
+      <p>
+        This digest covers literature and news discovered between <b>{start_str}</b> and <b>{today_str}</b>.
+        A total of <b>{total_raw}</b> items were collected from your configured journals and news sources,
+        of which <b>{total_annotated}</b> are summarised below.
+      </p>
+
+      <h3>Coverage & Sources</h3>
+      <ul>
+        {sources_html}
+      </ul>
+
+      <h3>Journal Overviews</h3>
+      {journal_summaries_html}
+
+      <h3>Detailed Items</h3>
 """
 
     current_topic = None
@@ -449,7 +573,7 @@ def send_email(html: str):
         return
 
     import smtplib
-    from email.mime.text import MIMEText
+    from email.mime_text import MIMEText
     from email.mime.multipart import MIMEMultipart
 
     msg = MIMEMultipart()
@@ -476,40 +600,58 @@ if __name__ == "__main__":
     sources_df = pd.read_csv("sources.csv")
     keywords_context = dict(zip(keywords_df.topic, keywords_df.keywords))
 
+    # Define review window explicitly
+    today = datetime.date.today()
+    start_date = today - datetime.timedelta(days=LOOKBACK_DAYS)
+
     print("[STEP] Starting collection pipeline...")
-    journal_papers = fetch_openalex_journal_watch(sources_df)
+    journal_papers = fetch_openalex_journal_watch(sources_df, start_date)
     rss_news = fetch_rss_feeds(sources_df)
 
     all_raw_items = journal_papers + rss_news
     print(f"\n[INFO] Total raw items collected: {len(all_raw_items)}")
 
+    # Build raw stats
+    source_counts_raw = Counter(it.get("source", "Unknown") for it in all_raw_items)
+
     if not all_raw_items:
         print(f"[INFO] No new items found in the last {LOOKBACK_DAYS} days.")
-        # Still produce a minimal “no items” newsletter
-        html = build_newsletter_html([])
+        review_stats = {
+            "start_date": start_date.isoformat(),
+            "end_date": today.isoformat(),
+            "total_raw": 0,
+            "per_source": {},
+        }
+        html = build_newsletter_html([], review_stats, journal_summaries={})
         save_html(html)
         send_email(html)
         raise SystemExit(0)
 
-    # Use AI to filter and prioritise
-    selected_items = summarize_with_ai(all_raw_items, keywords_context, batch_size=3)
+    # Use AI to annotate and prioritise (no more hard Yes/No gating)
+    annotated_items = summarize_with_ai(all_raw_items, keywords_context, batch_size=3)
 
-    if selected_items:
-        print(f"[INFO] {len(selected_items)} items passed AI relevance filter.")
-        items_for_newsletter = selected_items
-    else:
-        print("[INFO] No items passed AI relevance filter. Falling back to all items.")
-        # Fallback: mark all items as priority 2 “worth scanning” if not already set
-        for item in all_raw_items:
-            item.setdefault("priority", "2")
-            item.setdefault("topic", item.get("topic", "General"))
-            item.setdefault(
-                "highlight",
-                truncate_text(item.get("abstract", ""), max_chars=200),
-            )
-        items_for_newsletter = all_raw_items
+    # Build stats for annotated items
+    source_counts_annotated = Counter(
+        it.get("source", "Unknown") for it in annotated_items
+    )
+    per_source_stats = {}
+    for src, raw_count in source_counts_raw.items():
+        per_source_stats[src] = {
+            "raw": raw_count,
+            "annotated": source_counts_annotated.get(src, 0),
+        }
+
+    review_stats = {
+        "start_date": start_date.isoformat(),
+        "end_date": today.isoformat(),
+        "total_raw": len(all_raw_items),
+        "per_source": per_source_stats,
+    }
+
+    # Generate per-journal summaries based on annotated items
+    journal_summaries = generate_journal_summaries(annotated_items)
 
     # Build, save, and send newsletter
-    html = build_newsletter_html(items_for_newsletter)
+    html = build_newsletter_html(annotated_items, review_stats, journal_summaries)
     save_html(html)
     send_email(html)
