@@ -9,7 +9,7 @@ import feedparser
 import requests
 import google.generativeai as genai
 
-# Try to load .env if present
+# Try to load .env if present (for local runs)
 try:
     from dotenv import load_dotenv
 
@@ -37,7 +37,9 @@ EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER")
 
 if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY is missing. Add it to your .env file.")
+    raise ValueError(
+        "GEMINI_API_KEY is missing. Add it to your .env file or GitHub Secrets."
+    )
 
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.0-flash")
@@ -54,7 +56,7 @@ HEADERS = {
 JOURNAL_ID_CACHE = {}
 
 
-def truncate_text(text: str, max_chars: int = 600) -> str:
+def truncate_text(text: str, max_chars: int = 300) -> str:
     """Truncate long text to avoid huge prompts."""
     if not isinstance(text, str):
         return ""
@@ -149,7 +151,7 @@ def fetch_openalex_journal_watch(sources_df: pd.DataFrame):
                 abstract_text = reconstruct_abstract(
                     work.get("abstract_inverted_index")
                 )
-                abstract_text = truncate_text(abstract_text, max_chars=600)
+                abstract_text = truncate_text(abstract_text, max_chars=300)
                 url = work.get("doi") or work.get("id") or ""
                 papers.append(
                     {
@@ -205,7 +207,7 @@ def fetch_rss_feeds(sources_df: pd.DataFrame):
                     or entry.get("description")
                     or "No summary provided."
                 )
-                abstract_text = truncate_text(abstract_text, max_chars=600)
+                abstract_text = truncate_text(abstract_text, max_chars=300)
                 news_items.append(
                     {
                         "title": entry.get("title", "No title"),
@@ -223,7 +225,7 @@ def fetch_rss_feeds(sources_df: pd.DataFrame):
     return news_items
 
 
-def summarize_with_ai(items, keywords_context, batch_size: int = 5):
+def summarize_with_ai(items, keywords_context, batch_size: int = 3):
     """
     Use Gemini to filter, categorise and highlight items in batches.
 
@@ -338,7 +340,24 @@ Items:
 def build_newsletter_html(items):
     """Build grouped HTML newsletter from selected items."""
     if not items:
-        return "<html><body><p>No relevant items this week.</p></body></html>"
+        # Minimal skeleton when no items or no relevant items
+        today_str = datetime.date.today().isoformat()
+        return f"""
+<html>
+  <body style="font-family: Arial, sans-serif; color: #333;">
+    <div style="background-color: #2c3e50; padding: 16px; text-align: center;">
+      <h2 style="color: #ecf0f1; margin: 0;">⛏️ Weekly Mining & Processing Digest</h2>
+      <div style="color: #bdc3c7; font-size: 12px;">{today_str}</div>
+    </div>
+    <div style="padding: 20px;">
+      <p>No new relevant items were identified for this period.</p>
+    </div>
+    <div style="text-align: center; font-size: 11px; color: #aaa; padding: 16px;">
+      Generated automatically by your Mining Digest agent.
+    </div>
+  </body>
+</html>
+"""
 
     df = pd.DataFrame(items)
 
@@ -464,16 +483,33 @@ if __name__ == "__main__":
     all_raw_items = journal_papers + rss_news
     print(f"\n[INFO] Total raw items collected: {len(all_raw_items)}")
 
-    if all_raw_items:
-        selected_items = summarize_with_ai(
-            all_raw_items, keywords_context, batch_size=5
-        )
-
-        if selected_items:
-            html = build_newsletter_html(selected_items)
-            save_html(html)
-            send_email(html)
-        else:
-            print("[INFO] No items passed AI relevance filter.")
-    else:
+    if not all_raw_items:
         print(f"[INFO] No new items found in the last {LOOKBACK_DAYS} days.")
+        # Still produce a minimal “no items” newsletter
+        html = build_newsletter_html([])
+        save_html(html)
+        send_email(html)
+        raise SystemExit(0)
+
+    # Use AI to filter and prioritise
+    selected_items = summarize_with_ai(all_raw_items, keywords_context, batch_size=3)
+
+    if selected_items:
+        print(f"[INFO] {len(selected_items)} items passed AI relevance filter.")
+        items_for_newsletter = selected_items
+    else:
+        print("[INFO] No items passed AI relevance filter. Falling back to all items.")
+        # Fallback: mark all items as priority 2 “worth scanning” if not already set
+        for item in all_raw_items:
+            item.setdefault("priority", "2")
+            item.setdefault("topic", item.get("topic", "General"))
+            item.setdefault(
+                "highlight",
+                truncate_text(item.get("abstract", ""), max_chars=200),
+            )
+        items_for_newsletter = all_raw_items
+
+    # Build, save, and send newsletter
+    html = build_newsletter_html(items_for_newsletter)
+    save_html(html)
+    send_email(html)
