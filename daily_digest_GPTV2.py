@@ -401,9 +401,10 @@ def generate_journal_summaries(items):
     """
     Generate brief per-journal summaries based on the annotated items.
 
+    Purely deterministic: no extra Gemini calls (avoids quota/rate-limit failures).
     Only considers items of type 'Academic'.
     """
-    print("\n[STEP] Generating per-journal summaries...")
+    print("\n[STEP] Generating per-journal summaries (deterministic)...")
     journal_items = defaultdict(list)
     for it in items:
         if it.get("type") == "Academic":
@@ -411,43 +412,31 @@ def generate_journal_summaries(items):
 
     summaries = {}
     for journal, j_items in journal_items.items():
-        print(f"[AI] Summarising journal: {journal} ({len(j_items)} items)")
-        titles_and_highlights = []
-        for idx, it in enumerate(j_items, start=1):
-            titles_and_highlights.append(
-                f"{idx}. Title: {it.get('title', '')}\n   Highlight: {it.get('highlight', '')}"
-            )
-        block = "\n".join(titles_and_highlights)
+        n_total = len(j_items)
+        priorities = [str(it.get("priority", "2")) for it in j_items]
+        n_must = sum(1 for p in priorities if p.startswith("1"))
+        n_scan = n_total - n_must
 
-        prompt = f"""
-You are summarising recent publications in the journal '{journal}' 
-for a mining & mineral processing researcher.
+        categories = [it.get("topic", "General") for it in j_items]
+        cat_counts = Counter(categories)
+        # Most common up to 3
+        top_cats = [c for c, _ in cat_counts.most_common(3)]
+        if top_cats:
+            if len(top_cats) == 1:
+                cat_str = top_cats[0]
+            elif len(top_cats) == 2:
+                cat_str = f"{top_cats[0]} and {top_cats[1]}"
+            else:
+                cat_str = f"{top_cats[0]}, {top_cats[1]} and {top_cats[2]}"
+            theme_sentence = f"Main themes this period are {cat_str}."
+        else:
+            theme_sentence = "The themes are mixed this period."
 
-Here are some recent papers from this journal (each with title and a short highlight):
-
-{block}
-
-Write a concise overview of the main technical themes and trends represented by these papers.
-
-Requirements:
-- Length: 2–3 sentences total.
-- Focus on themes and trends (e.g., focus areas, methods, types of ore, process challenges).
-- Do NOT list individual paper titles.
-- Do NOT use bullet points or numbered lists.
-- Write in plain, professional, neutral language.
-
-Now provide the 2–3 sentence summary.
-"""
-
-        try:
-            response = model.generate_content(prompt)
-            text = response.text.strip()
-            summaries[journal] = text
-        except Exception as e:
-            print(f"[AI] Error generating summary for journal {journal}: {e}")
-            summaries[journal] = "Summary unavailable due to an AI error."
-
-        time.sleep(2)
+        summary = (
+            f"{theme_sentence} The digest includes {n_total} papers from {journal}, "
+            f"with {n_must} marked as must-read and {n_scan} worth scanning."
+        )
+        summaries[journal] = summary
 
     return summaries
 
@@ -679,7 +668,7 @@ if __name__ == "__main__":
         "per_source": per_source_stats,
     }
 
-    # Generate per-journal summaries based on annotated items
+    # Generate per-journal summaries based on annotated items (deterministic)
     journal_summaries = generate_journal_summaries(annotated_items)
 
     # Build, save, and send newsletter
