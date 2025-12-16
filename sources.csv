@@ -1,30 +1,45 @@
 name,type,identifier
-"Minerals (MDPI)",journal,"Minerals"
-"Metals (MDPI)",journal,"Metals"
-"SAIMM Journal",journal,"Journal of the Southern African Institute of Mining and Metallurgy"
-"Nature Geoscience",journal,"Nature Geoscience"
-"Nature Communications",journal,"Nature Communications"
-"Minerals Engineering",journal,"Minerals Engineering"
-"Hydrometallurgy",journal,"Hydrometallurgy"
-"Powder Technology",journal,"Powder Technology"
-"Journal of Process Control",journal,"Journal of Process Control"
-"Control Engineering Practice",journal,"Control Engineering Practice"
+Minerals (MDPI),journal,Minerals
+Metals (MDPI),journal,Metals
+SAIMM Journal,journal,Journal of the Southern African Institute of Mining and Metallurgy
+Nature Geoscience,journal,Nature Geoscience
+Nature Communications,journal,Nature Communications
+Minerals Engineering,journal,Minerals Engineering
+Hydrometallurgy,journal,Hydrometallurgy
+Powder Technology,journal,Powder Technology
+Journal of Process Control,journal,Journal of Process Control
+Control Engineering Practice,journal,Control Engineering Practice
 "Mining, Metallurgy & Exploration",journal,"Mining, Metallurgy & Exploration"
-"Journal of Cleaner Production",journal,"Journal of Cleaner Production"
-"Resources Policy",journal,"Resources Policy"
+Journal of Cleaner Production,journal,Journal of Cleaner Production
+Resources Policy,journal,Resources Policy
 "Resources, Conservation & Recycling",journal,"Resources, Conservation and Recycling"
-"Bioresource Technology",journal,"Bioresource Technology"
-"Waste Management",journal,"Waste Management"
-"Journal of Sustainable Metallurgy",journal,"Journal of Sustainable Metallurgy"
-"Mine Water and the Environment",journal,"Mine Water and the Environment"
-"Canadian Metallurgical Quarterly",journal,"Canadian Metallurgical Quarterly"
-"IEEE Transactions on Industry Applications",journal,"IEEE Transactions on Industry Applications"
-"International Journal of Rock Mechanics",journal,"International Journal of Rock Mechanics and Mining Sciences"
-"SME Annual Conference",journal,"SME Annual Conference"
-"CIM Journal",journal,"CIM Journal"
-"Mining Engineering (SME)",journal,"Mining Engineering"
-"AusIMM Bulletin",journal,"AusIMM Bulletin"
-"Iron Ore Conference",journal,"Iron Ore"
-"International Mineral Processing Congress",journal,"International Mineral Processing Congress"
-"World Gold Conference",journal,"World Gold"
-"Copper International Conference",journal,"Copper International Conference"
+Bioresource Technology,journal,Bioresource Technology
+Waste Management,journal,Waste Management
+Journal of Sustainable Metallurgy,journal,Journal of Sustainable Metallurgy
+Mine Water and the Environment,journal,Mine Water and the Environment
+Canadian Metallurgical Quarterly,journal,Canadian Metallurgical Quarterly
+IEEE Transactions on Industry Applications,journal,IEEE Transactions on Industry Applications
+International Journal of Rock Mechanics and Mining Sciences,journal,International Journal of Rock Mechanics and Mining Sciences
+CIM Journal,journal,CIM Journal
+Mining Engineering (SME),journal,Mining Engineering
+"International Journal of Mining, Reclamation and Environment",journal,"International Journal of Mining, Reclamation and Environment"
+Mineral Processing and Extractive Metallurgy,journal,Mineral Processing and Extractive Metallurgy
+Mining Technology (Transactions of the Institutions of Mining and Metallurgy),journal,Mining Technology (Transactions of the Institutions of Mining and Metallurgy)
+International Journal of Coal Preparation and Utilization,journal,International Journal of Coal Preparation and Utilization
+Ore Geology Reviews,journal,Ore Geology Reviews
+International Journal of Mining Science and Technology,journal,International Journal of Mining Science and Technology
+International Geology Review,journal,International Geology Review
+Australian Journal of Earth Sciences,journal,Australian Journal of Earth Sciences
+Separation and Purification Technology,journal,Separation and Purification Technology
+Advanced Powder Technology,journal,Advanced Powder Technology
+Computers & Chemical Engineering,journal,Computers & Chemical Engineering
+Chemical Engineering Science,journal,Chemical Engineering Science
+International Journal of Coal Science and Technology,journal,International Journal of Coal Science and Technology
+Mineral Economics,journal,Mineral Economics
+OneMine,repository,https://www.onemine.org
+SME Annual Conference,repository,SME Annual Conference
+International Mineral Processing Congress,repository,International Mineral Processing Congress
+World Gold Conference,repository,World Gold Conference
+Iron Ore Conference,repository,Iron Ore Conference
+Copper International Conference,repository,Copper International Conference
+AusIMM Bulletin,repository,AusIMM Bulletin
