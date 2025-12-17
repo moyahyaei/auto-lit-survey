@@ -19,10 +19,20 @@ lib64/
 parts/
 sdist/
 var/
+output/
 *.egg-info/
 .installed.cfg
 *.egg
-
+*.zip
+daily_digest_GPTV1.py
+daily_digest_GPTV2.py
+daily_digest_GPTV3.py
+daily_digest_VG1.py
+requirement_full.txt
+check_model.py
+debug.py
+test_env.py
+test_onemine_scrape.py
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
