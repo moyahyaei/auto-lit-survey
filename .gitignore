@@ -28,7 +28,7 @@ daily_digest_GPTV1.py
 daily_digest_GPTV2.py
 daily_digest_GPTV3.py
 daily_digest_VG1.py
-requirement_full.txt
+requirements_full.txt
 check_model.py
 debug.py
 test_env.py
