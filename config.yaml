@@ -1,0 +1,11 @@
+# Configuration for the Recent Publications Digest
+lookback_days: 7  # How many days into the past to search
+max_items_per_feed: 5 # Maximum items to retrieve from each feed
+
+email_subject: "Recent Publications Digest" #Email subject line
+
+# Gemini API Rate Limiting
+gemini_min_interval_seconds: 2.0
+gemini_error_sleep_seconds: 10.0
+
+repository_extra_days: 30 # Extra days to consider for repositories in addition to lookback_days, set to Zero if no extra days is necessary

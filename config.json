@@ -1,5 +1,18 @@
 {
+  "_comment": "Configuration for the Recent Publications Digest automation",
+  
+  "_comment_lookback_days_description": "How many days into the past to search for new papers",
   "lookback_days": 7,
+
+  "_comment_max_items_per_feed_description": "Limit the number of items pulled from a single RSS feed",
   "max_items_per_feed": 5,
-  "email_subject": "Weekly Mining & Processing Digest"
+  "email_subject_description": "Definition of the email subject line",
+  "email_subject": "Recent Publications Digest",
+
+  "_comment_gemini": "Settings for the Gemini AI API rate limiting",
+  "gemini_min_interval_seconds": 2.0,
+  "gemini_error_sleep_seconds": 10.0,
+
+  "_comment_repository_extra_days": "Settings for the extra days that repositories are looked back in addition to the lookback_days",
+  "repository_extra_days": 30
 }

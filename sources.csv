@@ -36,10 +36,11 @@ Computers & Chemical Engineering,journal,Computers & Chemical Engineering
 Chemical Engineering Science,journal,Chemical Engineering Science
 International Journal of Coal Science and Technology,journal,International Journal of Coal Science and Technology
 Mineral Economics,journal,Mineral Economics
-OneMine,repository,https://www.onemine.org
-SME Annual Conference,repository,SME Annual Conference
-International Mineral Processing Congress,repository,International Mineral Processing Congress
-World Gold Conference,repository,World Gold Conference
-Iron Ore Conference,repository,Iron Ore Conference
-Copper International Conference,repository,Copper International Conference
-AusIMM Bulletin,repository,AusIMM Bulletin
+OneMine (global),repository,onemine:
+SME Annual Conference,repository,onemine:keywords=SME%20Annual%20Conference&searchfield=all
+International Mineral Processing Congress,repository,onemine:keywords=International%20Mineral%20Processing%20Congress&searchfield=all
+World Gold Conference,repository,onemine:keywords=World%20Gold%20Conference&searchfield=all
+Iron Ore Conference,repository,onemine:keywords=Iron%20Ore%20Conference&searchfield=all
+Copper International Conference,repository,onemine:keywords=Copper%20International%20Conference&searchfield=all
+AusIMM Bulletin,repository,onemine:keywords=AusIMM%20Bulletin&searchfield=all
+

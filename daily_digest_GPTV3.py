@@ -6,6 +6,7 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 from collections import defaultdict, Counter
+from urllib.parse import urlparse, parse_qsl
 
 import requests
 import pandas as pd
@@ -17,6 +18,8 @@ import google.generativeai as genai
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 
 from dotenv import load_dotenv
 
@@ -27,43 +30,31 @@ from dotenv import load_dotenv
 
 
 def utc_today_date() -> dt.date:
-    # Use UTC to avoid local timezone surprises in GitHub Actions
-    return dt.datetime.utcnow().date()
+    # timezone-aware UTC date (avoid deprecation warnings)
+    return dt.datetime.now(dt.timezone.utc).date()
 
 
 def parse_date_flexible(s: str) -> Optional[dt.date]:
-    """
-    Tries to parse a date from various formats.
-    Returns None if parsing fails.
-    """
     if not s:
         return None
     s = s.strip()
 
-    # common: "Sep 1, 2024"
     for fmt in ("%b %d, %Y", "%B %d, %Y", "%Y-%m-%d"):
         try:
             return dt.datetime.strptime(s, fmt).date()
         except ValueError:
             pass
 
-    # RSS often uses RFC822 or ISO-ish; feedparser may already parse into struct_time
-    # We handle simple ISO substrings as fallback:
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         try:
             return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except ValueError:
             return None
-
     return None
 
 
 def in_window(d: Optional[dt.date], start: dt.date, end: dt.date) -> bool:
-    """
-    Inclusive window: start <= d <= end.
-    If d is None => False.
-    """
     if d is None:
         return False
     return start <= d <= end
@@ -77,6 +68,13 @@ def normalize_ws(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
+def normalize_name(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"&", " and ", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
 # =========================
 # Data model
 # =========================
@@ -86,14 +84,13 @@ def normalize_ws(s: str) -> str:
 class Item:
     title: str
     url: str
-    source: str  # journal / rss / repository name
+    source: str
     source_type: str  # "Academic" | "News" | "Repository"
     published_date: Optional[dt.date]
     authors: Optional[str] = None
     abstract: Optional[str] = None
 
-    # Filled by AI
-    decision: Optional[str] = None  # "MUST_READ" | "SCAN" | "SKIP"
+    decision: Optional[str] = None
     category: Optional[str] = None
     highlight: Optional[str] = None
     rationale: Optional[str] = None
@@ -126,39 +123,259 @@ LOOKBACK_DAYS = int(config.get("lookback_days", 7))
 MAX_ITEMS_PER_FEED = int(config.get("max_items_per_feed", 5))
 EMAIL_SUBJECT = str(config.get("email_subject", "Weekly Mining & Processing Digest"))
 
+# Repositories always scan +30 days
+REPO_EXTRA_DAYS = 30
+
 TODAY = utc_today_date()
 START_DATE = TODAY - dt.timedelta(days=LOOKBACK_DAYS)
-END_DATE = TODAY  # inclusive end date
+END_DATE = TODAY
+REPO_START_DATE = START_DATE - dt.timedelta(days=REPO_EXTRA_DAYS)
 
-print(f"[WINDOW] Coverage: {START_DATE} -> {END_DATE} (lookback_days={LOOKBACK_DAYS})")
+print(
+    f"[WINDOW] Coverage (Journals/RSS): {START_DATE} -> {END_DATE} (lookback_days={LOOKBACK_DAYS})"
+)
+print(
+    f"[WINDOW] Coverage (Repositories): {REPO_START_DATE} -> {END_DATE} (lookback_days+{REPO_EXTRA_DAYS})"
+)
 
-# Env vars (local via .env; GitHub Actions via secrets)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 EMAIL_SENDER = os.environ.get("EMAIL_SENDER")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER")
 
-print(f"[ENV CHECK] GEMINI_API_KEY present? {bool(GEMINI_API_KEY)}")
-print(f"[ENV CHECK] EMAIL_SENDER present? {bool(EMAIL_SENDER)}")
-print(f"[ENV CHECK] EMAIL_RECEIVER present? {bool(EMAIL_RECEIVER)}")
-
 if not GEMINI_API_KEY:
-    raise ValueError(
-        "GEMINI_API_KEY is missing. Set it in .env (local) or GitHub Secrets (Actions)."
-    )
+    raise ValueError("GEMINI_API_KEY is missing. Set it in .env or GitHub Secrets.")
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-GEMINI_MODEL = "gemini-2.0-pro"
-print(f"[GEMINI] Using model: {GEMINI_MODEL}")
-gemini_model = genai.GenerativeModel(GEMINI_MODEL)
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; MiningDigestBot/1.0; +https://example.com/bot)"
-}
-
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MiningDigestBot/1.0)"}
 SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
+
+
+# =========================
+# Gemini: auto-discovery + pacing
+# =========================
+
+# Default pacing: 2 seconds between Gemini calls (prevents 429s)
+GEMINI_MIN_INTERVAL_SECONDS = float(config.get("gemini_min_interval_seconds", 2.0))
+# If any error happens (non-429), wait this long before retrying
+GEMINI_ERROR_SLEEP_SECONDS = float(config.get("gemini_error_sleep_seconds", 10.0))
+
+# Optional override (if you ever want to force a model temporarily)
+GEMINI_MODEL_OVERRIDE = (os.environ.get("GEMINI_MODEL_OVERRIDE") or "").strip() or str(
+    config.get("gemini_model_override", "") or ""
+).strip()
+
+_LAST_GEMINI_CALL_TS = 0.0
+_GEMINI_MODEL_OBJS: Dict[str, genai.GenerativeModel] = {}
+_LAST_PRINTED_MODEL: Optional[str] = None
+
+
+def _strip_models_prefix(name: str) -> str:
+    name = (name or "").strip()
+    return name.replace("models/", "", 1) if name.startswith("models/") else name
+
+
+def list_available_gemini_models() -> List[str]:
+    """
+    Returns model names (without 'models/' prefix) that:
+    - contain 'gemini'
+    - support generateContent
+    """
+    candidates = []
+    try:
+        for m in genai.list_models():
+            mname = _strip_models_prefix(getattr(m, "name", "") or "")
+            methods = getattr(m, "supported_generation_methods", None) or []
+            if "generateContent" not in methods:
+                continue
+            if "gemini" not in mname.lower():
+                continue
+            candidates.append(mname)
+    except Exception as e:
+        print(
+            f"[GEMINI] list_models() failed (non-fatal). Will fall back to common defaults. Error: {e}"
+        )
+    return candidates
+
+
+def _parse_version(model_name: str) -> Tuple[int, int]:
+    """
+    Extracts (major, minor) from things like:
+    gemini-3.0-..., gemini-2.0-..., gemini-1.5-...
+    Unknown -> (0, 0)
+    """
+    s = model_name.lower()
+    m = re.search(r"gemini-(\d+)(?:\.(\d+))?", s)
+    if not m:
+        return (0, 0)
+    major = int(m.group(1))
+    minor = int(m.group(2) or 0)
+    return (major, minor)
+
+
+def _model_rank_key(model_name: str) -> Tuple[int, int, int, int, str]:
+    """
+    Higher is better (we'll sort descending):
+    - version major/minor
+    - prefer 'pro' over 'flash' (capability)
+    - prefer non-vision? (neutral)
+    - prefer 'latest' or 'stable' keywords slightly (optional)
+    """
+    name = model_name.lower()
+    major, minor = _parse_version(name)
+
+    pro_rank = 2 if "-pro" in name else (1 if "-flash" in name else 0)
+    stability_rank = 2 if "latest" in name else (1 if "stable" in name else 0)
+    return (major, minor, pro_rank, stability_rank, name)
+
+
+def choose_best_models() -> List[str]:
+    """
+    Returns a sorted list of candidate models, newest-first.
+    """
+    models = list_available_gemini_models()
+
+    # If list_models fails or returns nothing, fall back to sane defaults
+    if not models:
+        models = [
+            "gemini-2.0-pro",
+            "gemini-2.0-flash",
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+        ]
+
+    # De-dup while preserving sort later
+    models = list(dict.fromkeys(models))
+
+    models_sorted = sorted(models, key=_model_rank_key, reverse=True)
+
+    # Apply override (if provided) by putting it first
+    if GEMINI_MODEL_OVERRIDE:
+        override = _strip_models_prefix(GEMINI_MODEL_OVERRIDE)
+        if override in models_sorted:
+            models_sorted.remove(override)
+        models_sorted.insert(0, override)
+
+    # Show top few for debugging
+    print("[GEMINI] Candidate models (newest-first):")
+    for m in models_sorted[:10]:
+        print(f"  - {m}")
+
+    return models_sorted
+
+
+def get_gemini_model_obj(model_name: str) -> genai.GenerativeModel:
+    model_name = _strip_models_prefix(model_name)
+    if model_name not in _GEMINI_MODEL_OBJS:
+        _GEMINI_MODEL_OBJS[model_name] = genai.GenerativeModel(model_name)
+    return _GEMINI_MODEL_OBJS[model_name]
+
+
+def log_gemini_model(model_name: str) -> None:
+    global _LAST_PRINTED_MODEL
+    if _LAST_PRINTED_MODEL != model_name:
+        print(f"[GEMINI] Using model: {model_name}")
+        _LAST_PRINTED_MODEL = model_name
+
+
+def enforce_min_interval() -> None:
+    global _LAST_GEMINI_CALL_TS
+    now = time.time()
+    wait = (_LAST_GEMINI_CALL_TS + GEMINI_MIN_INTERVAL_SECONDS) - now
+    if wait > 0:
+        time.sleep(wait)
+    _LAST_GEMINI_CALL_TS = time.time()
+
+
+def ai_rate_limit_sleep_from_error(e: Exception, base: int = 60) -> None:
+    """
+    If Gemini returns a retry_delay hint, honor it; else sleep base seconds.
+    """
+    msg = str(e)
+    m = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", msg)
+    if m:
+        delay = max(base, int(m.group(1)))
+    else:
+        delay = base
+    print(f"[AI] Rate limit/transient: sleeping {delay}s ...")
+    time.sleep(delay)
+
+
+def parse_json_strict(text: str) -> Optional[dict]:
+    t = (text or "").strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t)
+    t = re.sub(r"\s*```$", "", t)
+    t = t.strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        m = re.search(r"\{.*\}", t, flags=re.DOTALL)
+        if not m:
+            return None
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return None
+
+
+# Build model candidates at startup
+GEMINI_MODELS_TRY = choose_best_models()
+
+
+def gemini_generate_with_retry(prompt: str, max_attempts_per_model: int = 3) -> str:
+    """
+    Uses newest-available model list from list_models(), tries in order.
+    Adds:
+    - enforced pacing between calls (min interval)
+    - model fallback if 404/unsupported or persistent 429
+    """
+    last_err = None
+
+    for model_name in GEMINI_MODELS_TRY:
+        model_obj = get_gemini_model_obj(model_name)
+
+        for attempt in range(1, max_attempts_per_model + 1):
+            try:
+                enforce_min_interval()
+                log_gemini_model(model_name)
+                resp = model_obj.generate_content(prompt)
+                txt = (getattr(resp, "text", "") or "").strip()
+                if not txt:
+                    raise RuntimeError("Empty Gemini response.")
+                return txt
+
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+                print(
+                    f"[AI] Error model={model_name} attempt {attempt}/{max_attempts_per_model}: {e}"
+                )
+
+                # If model truly not available/unsupported -> try next model immediately
+                if (
+                    "404" in msg and ("not found" in msg or "not supported" in msg)
+                ) or "unsupported" in msg:
+                    break
+
+                # Rate limit -> back off, then retry; if still failing after attempts, fall back to next model
+                if (
+                    "429" in msg
+                    or "resource exhausted" in msg
+                    or "quota" in msg
+                    or "rate" in msg
+                ):
+                    ai_rate_limit_sleep_from_error(e, base=60)
+                else:
+                    # Generic errors: small wait, then retry
+                    time.sleep(GEMINI_ERROR_SLEEP_SECONDS)
+
+        # next model
+
+    raise RuntimeError(
+        f"Gemini failed for all candidate models. Last error: {last_err}"
+    )
 
 
 # =========================
@@ -167,28 +384,13 @@ SESSION.headers.update(HEADERS)
 
 
 def load_keywords_csv(path: str) -> Dict[str, str]:
-    """
-    keywords.csv expected format:
-    topic,keywords
-    Mineral Processing,"flotation, comminution, grinding"
-    """
     df = pd.read_csv(path)
     if "topic" not in df.columns or "keywords" not in df.columns:
         raise ValueError("keywords.csv must have columns: topic, keywords")
-    mapping = dict(zip(df["topic"].astype(str), df["keywords"].astype(str)))
-    return mapping
+    return dict(zip(df["topic"].astype(str), df["keywords"].astype(str)))
 
 
 def load_sources_csv(path: str) -> pd.DataFrame:
-    """
-    sources.csv expected columns:
-    name,type,identifier
-
-    type can include:
-      - journal     (OpenAlex journal/source name)
-      - rss         (RSS url)
-      - repository  (OneMine, etc.)
-    """
     df = pd.read_csv(path)
     needed = {"name", "type", "identifier"}
     if not needed.issubset(set(df.columns)):
@@ -208,33 +410,65 @@ OPENALEX_SOURCE_CACHE: Dict[str, str] = {}
 
 def openalex_resolve_source_id(journal_name: str) -> Optional[str]:
     """
-    Resolve an OpenAlex 'source' id from a display name.
-    Returns short id like 'S123456789'.
+    Fixes:
+    - Commas in journal names: uses `search=` instead of filter=display_name.search:"..."
+    - Sloppy first-hit mapping: chooses best match (prevents Minerals Engineering -> Minerals)
     """
-    j = journal_name.strip()
-    if j in OPENALEX_SOURCE_CACHE:
-        return OPENALEX_SOURCE_CACHE[j]
+    q = (journal_name or "").strip()
+    if not q:
+        return None
+    if q in OPENALEX_SOURCE_CACHE:
+        return OPENALEX_SOURCE_CACHE[q]
 
     url = "https://api.openalex.org/sources"
-    params = {"filter": f'display_name.search:"{j}"', "per-page": 1}
+    params = {"search": q, "per-page": 25, "select": "id,display_name,issn_l,issn"}
     r = SESSION.get(url, params=params, timeout=30)
     if r.status_code != 200:
-        print(f"[OpenAlex][ID] Failed for '{j}' status={r.status_code}")
+        print(f"[OpenAlex][ID] Failed for '{q}' status={r.status_code}")
         return None
 
-    results = r.json().get("results", [])
+    results = r.json().get("results", []) or []
     if not results:
-        print(f"[OpenAlex][ID] No match for '{j}'")
+        print(f"[OpenAlex][ID] No match for '{q}'")
         return None
 
-    full_id = results[0].get("id", "")
+    qn = normalize_name(q)
+
+    def score(res: dict) -> float:
+        name = (res.get("display_name") or "").strip()
+        nn = normalize_name(name)
+        if not nn:
+            return 1e9
+        if nn == qn:
+            return 0.0
+
+        length_penalty = 0.0
+        if len(nn) < max(5, int(0.7 * len(qn))):
+            length_penalty += 2.0
+
+        q_tokens = set(qn.split())
+        n_tokens = set(nn.split())
+        inter = len(q_tokens & n_tokens)
+        union = max(1, len(q_tokens | n_tokens))
+        jaccard = inter / union
+        sim_penalty = (1.0 - jaccard) * 3.0
+
+        prefix_bonus = 0.0
+        if nn.startswith(qn) or qn.startswith(nn):
+            prefix_bonus -= 0.5
+        if qn in nn:
+            prefix_bonus -= 0.3
+
+        return 1.0 + sim_penalty + length_penalty + prefix_bonus
+
+    best = min(results, key=score)
+    full_id = (best.get("id") or "").strip()
     short_id = full_id.replace("https://openalex.org/", "").strip()
     if not short_id:
-        print(f"[OpenAlex][ID] Bad id for '{j}'")
         return None
 
-    OPENALEX_SOURCE_CACHE[j] = short_id
-    print(f"[OpenAlex][ID] {j} -> {short_id}")
+    OPENALEX_SOURCE_CACHE[q] = short_id
+    print(f"[OpenAlex][ID] {q} -> {short_id}")
     return short_id
 
 
@@ -252,12 +486,7 @@ def openalex_reconstruct_abstract(inverted_index: Optional[dict]) -> str:
 def fetch_openalex_journal_items(
     sources_df: pd.DataFrame, start: dt.date, end: dt.date
 ) -> List[Item]:
-    """
-    Fetch items from OpenAlex for all journal entries in sources.csv.
-    Enforces date filtering in query AND again locally (safety).
-    """
     out: List[Item] = []
-
     journals = sources_df[sources_df["type"] == "journal"]["identifier"].tolist()
     if not journals:
         print("[OpenAlex] No journals configured.")
@@ -271,7 +500,6 @@ def fetch_openalex_journal_items(
             print(f"[OpenAlex] Skipping journal '{jname}' (no source id).")
             continue
 
-        # OpenAlex supports from_publication_date and to_publication_date in filters.
         base_url = "https://api.openalex.org/works"
         filter_str = (
             f"primary_location.source.id:{jid},"
@@ -282,7 +510,7 @@ def fetch_openalex_journal_items(
             "filter": filter_str,
             "per-page": MAX_ITEMS_PER_FEED,
             "sort": "publication_date:desc",
-            "select": "id,doi,title,publication_date,abstract_inverted_index,authorships,primary_location",
+            "select": "id,doi,title,publication_date,abstract_inverted_index,authorships",
         }
 
         try:
@@ -290,22 +518,19 @@ def fetch_openalex_journal_items(
             if r.status_code != 200:
                 print(f"[OpenAlex] {jname}: HTTP {r.status_code}")
                 continue
-            data = r.json()
-            results = data.get("results", [])
+            results = (r.json() or {}).get("results", []) or []
             print(f"[OpenAlex] {jname}: fetched {len(results)} candidates")
 
             for w in results:
                 pub = parse_date_flexible(w.get("publication_date", ""))
                 if not in_window(pub, start, end):
-                    # Extra safety: don't include out-of-window even if API returned it
                     continue
 
                 title = normalize_ws(w.get("title", ""))
                 doi = w.get("doi")
                 wid = w.get("id")
-                url = doi if doi else wid
+                url = doi if doi else wid or ""
 
-                # Authors
                 auths = []
                 for a in w.get("authorships") or []:
                     name = ((a.get("author") or {}).get("display_name") or "").strip()
@@ -313,10 +538,9 @@ def fetch_openalex_journal_items(
                         auths.append(name)
                 authors = ", ".join(auths) if auths else None
 
-                abstract = openalex_reconstruct_abstract(
-                    w.get("abstract_inverted_index")
+                abstract = normalize_ws(
+                    openalex_reconstruct_abstract(w.get("abstract_inverted_index"))
                 )
-                abstract = normalize_ws(abstract)
 
                 out.append(
                     Item(
@@ -330,7 +554,7 @@ def fetch_openalex_journal_items(
                     )
                 )
 
-            time.sleep(0.2)  # be polite
+            time.sleep(0.15)
         except Exception as e:
             print(f"[OpenAlex] {jname}: error {e}")
 
@@ -344,7 +568,6 @@ def fetch_openalex_journal_items(
 
 
 def parse_rss_entry_date(entry) -> Optional[dt.date]:
-    # feedparser provides published_parsed/updated_parsed as time.struct_time
     if hasattr(entry, "published_parsed") and entry.published_parsed:
         return dt.date(
             entry.published_parsed.tm_year,
@@ -357,8 +580,6 @@ def parse_rss_entry_date(entry) -> Optional[dt.date]:
             entry.updated_parsed.tm_mon,
             entry.updated_parsed.tm_mday,
         )
-
-    # fallback string
     s = getattr(entry, "published", "") or getattr(entry, "updated", "") or ""
     return parse_date_flexible(s)
 
@@ -385,9 +606,7 @@ def fetch_rss_items(
                 continue
 
             feed = feedparser.parse(resp.content)
-            entries = feed.entries[
-                : MAX_ITEMS_PER_FEED * 5
-            ]  # take more; filter by dates afterwards
+            entries = feed.entries[: MAX_ITEMS_PER_FEED * 6]
             kept = 0
 
             for e in entries:
@@ -398,7 +617,6 @@ def fetch_rss_items(
                 title = normalize_ws(getattr(e, "title", "") or "")
                 link = getattr(e, "link", "") or ""
 
-                # For RSS, "summary/description" is all we have; do NOT truncate
                 summary = (
                     getattr(e, "summary", "") or getattr(e, "description", "") or ""
                 )
@@ -427,69 +645,53 @@ def fetch_rss_items(
 
 
 # =========================
-# OneMine Repository Scraper (Option A)
+# OneMine Repository Scraper
 # =========================
 
 
-def onemine_build_search_url(
-    organization: str,
-    sort_by: str,
-    start: dt.date,
-    end: dt.date,
-    page: int = 1,
-    page_size: int = 20,
-    keywords: Optional[str] = None,
-) -> str:
-    """
-    Build OneMine search URL that supports:
-      - Organization
-      - SortBy=MostRecent
-      - DateFrom / DateTo
-      - Keywords (optional)
-    """
-    base = "https://www.onemine.org/search"
-    params = {
-        "Organization": organization,
-        "SortBy": sort_by,
-        "page": str(page),
-        "pageSize": str(page_size),
-        "DateFrom": start.isoformat(),
-        "DateTo": end.isoformat(),
-    }
-    if keywords:
-        params["Keywords"] = keywords
-        params["SearchField"] = "All"
-    # manual query build (avoid adding extra deps)
-    q = "&".join([f"{k}={requests.utils.quote(str(v))}" for k, v in params.items()])
-    return f"{base}?{q}"
+def onemine_parse_identifier(ident: str) -> Dict[str, str]:
+    raw = (ident or "").strip()
+    if not raw.lower().startswith("onemine:"):
+        return {}
+    rest = raw.split(":", 1)[1].strip()
+    if not rest:
+        return {}
+    if rest.lower().startswith("http"):
+        u = urlparse(rest)
+        return dict(parse_qsl(u.query, keep_blank_values=True))
+    params = dict(parse_qsl(rest, keep_blank_values=True))
+    if not params and "=" in rest:
+        k, v = rest.split("=", 1)
+        params = {k.strip(): v.strip()}
+    return params
+
+
+def onemine_build_params(
+    base_params: Dict[str, str], page: int, page_size: int
+) -> Dict[str, str]:
+    params = dict(base_params or {})
+    params["SortBy"] = params.get("SortBy", "MostRecent")
+    params["page"] = str(page)
+    params["pageSize"] = str(page_size)
+    return params
 
 
 def onemine_parse_list_page(html: str) -> List[dict]:
-    """
-    Parse OneMine search results list page.
-    Returns list of dicts with: title, url, author_text, date_text, snippet
-    """
     soup = BeautifulSoup(html, "html.parser")
     items = []
-    # Each result is <li class="item-list__item">
     for li in soup.select("ul.item-list li.item-list__item"):
         a_title = li.select_one("a.item-list__title")
         if not a_title:
             continue
-        title = safe_get_text(a_title)
-        href = a_title.get("href", "").strip()
-        if href.startswith("/"):
-            url = "https://www.onemine.org" + href
-        else:
-            url = href
 
-        # Author line like: <p class="item-list__date">By ...</p> (first occurrence)
-        # Published date line like: <p class="item-list__date">Sep 1, 2024</p> (later occurrence)
+        title = safe_get_text(a_title)
+        href = (a_title.get("href") or "").strip()
+        url = ("https://www.onemine.org" + href) if href.startswith("/") else href
+
         date_ps = li.select("p.item-list__date")
         author_text = safe_get_text(date_ps[0]) if len(date_ps) >= 1 else ""
         pub_text = safe_get_text(date_ps[-1]) if len(date_ps) >= 2 else ""
 
-        # snippet is visible <p> ... with hidden span. We’ll later fetch full page anyway.
         p_desc = li.select_one("p")
         snippet = safe_get_text(p_desc)
 
@@ -508,45 +710,28 @@ def onemine_parse_list_page(html: str) -> List[dict]:
 def onemine_fetch_document_abstract(
     doc_url: str,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Fetch a OneMine document page and extract:
-      - authors (if available)
-      - abstract/description full text (best-effort)
-    """
     try:
         r = SESSION.get(doc_url, timeout=45)
         if r.status_code != 200:
             return None, None
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # Heuristics: many OneMine docs have main content in article/section blocks.
-        # We try a few likely selectors.
-        # 1) meta description as fallback
         meta_desc = soup.select_one('meta[name="description"]')
         meta_abstract = meta_desc.get("content", "").strip() if meta_desc else ""
 
-        # 2) Look for a prominent paragraph block
-        # Often description is inside main content area, may include <p> with substantial text.
         main = soup.select_one("div.content[role='main']") or soup
         paragraphs = [
             normalize_ws(p.get_text(" ", strip=True)) for p in main.select("p")
         ]
-
-        # Remove short boilerplate lines
         paragraphs = [p for p in paragraphs if len(p) > 80]
 
-        # Build abstract as the longest paragraph or concatenation of first few
         abstract = ""
         if paragraphs:
-            # choose top 2-3 long paragraphs
             paragraphs.sort(key=len, reverse=True)
             abstract = " ".join(paragraphs[:3]).strip()
         elif meta_abstract:
             abstract = meta_abstract
 
-        # Authors: sometimes shown near top, but list pages already provide "By ..."
-        # We keep it best-effort; if not found, caller uses list page.
-        # Try to find “By …” patterns
         text = main.get_text(" ", strip=True)
         m = re.search(r"\bBy\s+([A-Z][^|•\n]{3,200})", text)
         authors = m.group(0).strip() if m else None
@@ -560,35 +745,17 @@ def fetch_onemine_repository_items(
     sources_df: pd.DataFrame,
     start: dt.date,
     end: dt.date,
-    max_pages: int = 3,
+    max_pages: int = 6,
     page_size: int = 20,
-    keywords: Optional[str] = None,
 ) -> List[Item]:
-    """
-    Scrape OneMine search pages for configured repository sources.
-
-    sources.csv: include a row like:
-      name,type,identifier
-      OneMine AUSIMM,repository,onemine:Organization=AUSIMM
-
-    Supported identifier formats:
-      - onemine:Organization=AUSIMM
-      - onemine:Organization=SME
-    """
     out: List[Item] = []
     repo_df = sources_df[sources_df["type"] == "repository"]
     if repo_df.empty:
         print("[Repo] No repository sources configured.")
         return out
 
-    # Find OneMine entries
-    onemine_rows = []
-    for _, row in repo_df.iterrows():
-        ident = row["identifier"].strip()
-        if ident.lower().startswith("onemine:"):
-            onemine_rows.append(row)
-
-    if not onemine_rows:
+    onemine_rows = repo_df[repo_df["identifier"].str.lower().str.startswith("onemine:")]
+    if onemine_rows.empty:
         print(
             "[Repo] No OneMine repository entries found (identifier must start with 'onemine:')."
         )
@@ -596,38 +763,28 @@ def fetch_onemine_repository_items(
 
     print(f"[Repo][OneMine] Fetching OneMine for {start} -> {end} ...")
 
-    for row in onemine_rows:
+    base_url = "https://www.onemine.org/search"
+
+    for _, row in onemine_rows.iterrows():
         name = row["name"].strip()
         ident = row["identifier"].strip()
+        base_params = onemine_parse_identifier(ident)
 
-        # parse organization
-        # ident like "onemine:Organization=AUSIMM"
-        org = None
-        m = re.search(r"Organization=([A-Za-z0-9_]+)", ident, flags=re.IGNORECASE)
-        if m:
-            org = m.group(1)
-        if not org:
-            print(
-                f"[Repo][OneMine] {name}: cannot parse Organization from identifier='{ident}'"
-            )
-            continue
+        # defensive cleanup if someone accidentally nested "onemine:" into keywords
+        if "keywords" in base_params and str(
+            base_params["keywords"]
+        ).lower().startswith("onemine:"):
+            base_params["keywords"] = str(base_params["keywords"])[7:]
 
-        kept = 0
-        candidates = []
+        candidates: List[dict] = []
 
         for page in range(1, max_pages + 1):
-            url = onemine_build_search_url(
-                organization=org,
-                sort_by="MostRecent",
-                start=start,
-                end=end,
-                page=page,
-                page_size=page_size,
-                keywords=keywords,
+            params = onemine_build_params(base_params, page=page, page_size=page_size)
+            print(
+                f"[Repo][OneMine] GET {name}: page={page} url={base_url} params={params}"
             )
-            print(f"[Repo][OneMine] GET {name}: page={page} url={url}")
 
-            r = SESSION.get(url, timeout=45)
+            r = SESSION.get(base_url, params=params, timeout=45)
             if r.status_code != 200:
                 print(f"[Repo][OneMine] {name}: HTTP {r.status_code} on page {page}")
                 break
@@ -636,45 +793,56 @@ def fetch_onemine_repository_items(
             print(
                 f"[Repo][OneMine] {name}: parsed {len(parsed)} list items on page {page}"
             )
-
             if not parsed:
                 break
 
-            candidates.extend(parsed)
-            time.sleep(0.3)
+            page_dates = [parse_date_flexible(p.get("date_text", "")) for p in parsed]
+            page_dates = [d for d in page_dates if d]
 
-        # Turn candidates into Items, fetch full abstract per document page
+            if page_dates:
+                page_newest = max(page_dates)
+                page_oldest = min(page_dates)
+
+                if page_newest < start and page == 1:
+                    print(
+                        f"[Repo][OneMine][NOTE] {name}: newest item seen is {page_newest} < START_DATE={start}. Expect 0 in-window results."
+                    )
+                    break
+
+                candidates.extend(parsed)
+
+                # early-stop once we've passed start
+                if page_oldest < start:
+                    break
+            else:
+                candidates.extend(parsed)
+
+            time.sleep(0.25)
+
+        kept = 0
         for c in candidates:
             pub = parse_date_flexible(c.get("date_text", ""))
             if not in_window(pub, start, end):
                 continue
 
-            title = c["title"]
-            url = c["url"]
-            author_text = c.get("author_text", "")
-            authors = (
-                author_text.replace("By ", "").strip()
-                if author_text.lower().startswith("by ")
-                else author_text
-            )
+            authors = c.get("author_text", "")
+            if authors.lower().startswith("by "):
+                authors = authors[3:].strip()
 
-            # Fetch full doc page to get better abstract
-            doc_auth, abstract = onemine_fetch_document_abstract(url)
+            doc_auth, abstract = onemine_fetch_document_abstract(c["url"])
             if doc_auth and len(doc_auth) > len(authors or ""):
                 authors = (
-                    doc_auth.replace("By ", "").strip()
+                    doc_auth[3:].strip()
                     if doc_auth.lower().startswith("by ")
                     else doc_auth
                 )
-
             if not abstract:
-                # fallback to snippet
                 abstract = c.get("snippet", "")
 
             out.append(
                 Item(
-                    title=title,
-                    url=url,
+                    title=c["title"],
+                    url=c["url"],
                     source=name,
                     source_type="Repository",
                     published_date=pub,
@@ -691,100 +859,119 @@ def fetch_onemine_repository_items(
 
 
 # =========================
-# AI Scoring (Robust + Retry)
+# Dedup + CSV outputs
 # =========================
 
-AI_JSON_SCHEMA = """
-Return ONLY valid JSON with these keys:
+
+def dedupe_items(items: List[Item]) -> List[Item]:
+    seen = set()
+    out = []
+    for it in items:
+        u = (it.url or "").strip().lower()
+        key = u if u else (normalize_name(it.title), str(it.published_date or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+
+def write_raw_csv(path: str, items: List[Item]) -> None:
+    rows = []
+    for it in items:
+        rows.append(
+            {
+                "source_type": it.source_type,
+                "source": it.source,
+                "published_date": it.published_date.isoformat()
+                if it.published_date
+                else "",
+                "title": it.title,
+                "authors": it.authors or "",
+                "url": it.url,
+                "abstract": it.abstract or "",
+            }
+        )
+    pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8")
+
+
+def write_triaged_csv(path: str, items: List[Item]) -> None:
+    rows = []
+    for it in items:
+        rows.append(
+            {
+                "source_type": it.source_type,
+                "source": it.source,
+                "published_date": it.published_date.isoformat()
+                if it.published_date
+                else "",
+                "decision": it.decision or "",
+                "category": it.category or "",
+                "title": it.title,
+                "authors": it.authors or "",
+                "url": it.url,
+                "highlight": it.highlight or "",
+                "rationale": it.rationale or "",
+                "abstract": it.abstract or "",
+            }
+        )
+    pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8")
+
+
+# =========================
+# AI
+# =========================
+
+AI_TRIAGE_SCHEMA = """
+Return ONLY valid JSON in this exact shape:
 {
-  "decision": "MUST_READ" | "SCAN" | "SKIP",
-  "category": "short label",
-  "highlight": "one sentence highlight",
-  "rationale": "one short sentence why"
+  "items": [
+    {
+      "id": <int>,
+      "decision": "MUST_READ" | "GOOD_TO_READ" | "NOT_SURE",
+      "category": "short label",
+      "highlight": "one sentence highlight",
+      "rationale": "one short sentence why"
+    }
+  ]
 }
-"""
+""".strip()
 
 
-def ai_rate_limit_sleep(e: Exception) -> None:
-    msg = str(e)
-    # Gemini sometimes provides retry_delay seconds in the exception string
-    m = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", msg)
-    if m:
-        delay = int(m.group(1))
-        delay = max(delay, 10)
-        print(f"[AI] Rate limit hinted: sleeping {delay}s ...")
-        time.sleep(delay)
-        return
-    # fallback
-    print("[AI] Hit rate limit or transient error: sleeping 60s ...")
-    time.sleep(60)
-
-
-def gemini_call_with_retry(prompt: str, max_attempts: int = 4) -> str:
-    last_err = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            resp = gemini_model.generate_content(prompt)
-            txt = (resp.text or "").strip()
-            if not txt:
-                raise RuntimeError("Empty Gemini response.")
-            return txt
-        except Exception as e:
-            last_err = e
-            print(f"[AI] Error attempt {attempt}/{max_attempts}: {e}")
-            if "429" in str(e) or "quota" in str(e).lower() or "rate" in str(e).lower():
-                ai_rate_limit_sleep(e)
-            else:
-                time.sleep(5 * attempt)
-    raise RuntimeError(f"Gemini failed after {max_attempts} attempts: {last_err}")
-
-
-def parse_json_strict(text: str) -> Optional[dict]:
-    """
-    Extract and parse JSON strictly.
-    Handles cases where model wraps JSON in code fences.
-    """
-    t = text.strip()
-    # remove code fences if present
-    t = re.sub(r"^```(?:json)?\s*", "", t)
-    t = re.sub(r"\s*```$", "", t)
-    t = t.strip()
-
-    # attempt direct parse
-    try:
-        return json.loads(t)
-    except Exception:
-        # try to find a JSON object substring
-        m = re.search(r"\{.*\}", t, flags=re.DOTALL)
-        if not m:
-            return None
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return None
-
-
-def ai_classify_items(
-    items: List[Item], keywords_context: Dict[str, str]
+def ai_classify_items_batched(
+    items: List[Item], keywords_context: Dict[str, str], batch_size: int = 6
 ) -> List[Item]:
-    """
-    Classify each item using Gemini.
-    NO abstract truncation. We send the full abstract we have.
-    """
     if not items:
         return []
 
     interests = "; ".join([f"{k}: {v}" for k, v in keywords_context.items()])
+    print(
+        f"[AI] Classifying {len(items)} Academic/Repository items with Gemini (batch_size={batch_size}) ..."
+    )
+
+    id_to_item: Dict[int, Item] = {}
+    packed: List[dict] = []
+    for i, it in enumerate(items, start=1):
+        id_to_item[i] = it
+        packed.append(
+            {
+                "id": i,
+                "title": it.title,
+                "source": it.source,
+                "published_date": it.published_date.isoformat()
+                if it.published_date
+                else "",
+                "authors": it.authors or "",
+                "abstract": normalize_ws(it.abstract or "")
+                or "(No abstract/description available.)",
+                "url": it.url,
+            }
+        )
 
     rated: List[Item] = []
-    print(f"[AI] Classifying {len(items)} items with Gemini ({GEMINI_MODEL}) ...")
 
-    for idx, it in enumerate(items, start=1):
-        print(f"[AI] {idx}/{len(items)}: {it.title[:80]}")
-
-        abstract = normalize_ws(it.abstract or "")
-        if not abstract:
-            abstract = "(No abstract/description available.)"
+    for batch_start in range(0, len(packed), batch_size):
+        batch = packed[batch_start : batch_start + batch_size]
 
         prompt = f"""
 You are an expert research triage assistant for Mining, Mineral Processing, Extractive Metallurgy, and Automation/Control.
@@ -793,92 +980,146 @@ My interests (topics -> keywords):
 {interests}
 
 Task:
-Evaluate the item below strictly against these interests.
-Be tolerant to spelling variants (US/UK), capitalization, minor typos, and terminology differences.
-If it's remotely relevant, do NOT over-filter.
+For each item below, classify relevance for my review.
 
 Decision rules:
-- MUST_READ: highly relevant or impactful for my interests; likely worth deep reading.
-- SCAN: relevant enough to skim or keep; may inform trend awareness.
-- SKIP: not relevant.
+- MUST_READ: highly relevant or impactful.
+- GOOD_TO_READ: relevant enough to read/skim.
+- NOT_SURE: uncertain relevance; keep as "needs manual check".
 
-Item:
-Title: {it.title}
-Source: {it.source} ({it.source_type})
-Published date: {it.published_date}
-Authors: {it.authors or "Unknown"}
-Abstract/Description:
-{abstract}
+Return decisions for ALL items you are given (do not skip any).
 
-{AI_JSON_SCHEMA}
+Items (JSON):
+{json.dumps(batch, ensure_ascii=False)}
+
+{AI_TRIAGE_SCHEMA}
 """.strip()
 
-        try:
-            text = gemini_call_with_retry(prompt, max_attempts=4)
-            data = parse_json_strict(text)
-            if not data:
-                print("[AI] Bad JSON response. Marking as SCAN with fallback.")
-                it.decision = "SCAN"
+        text = gemini_generate_with_retry(prompt, max_attempts_per_model=3)
+        data = parse_json_strict(text)
+
+        if not data or "items" not in data:
+            print(
+                "[AI] Bad JSON response for batch. Marking all in batch as NOT_SURE (fail-open)."
+            )
+            for b in batch:
+                it = id_to_item[b["id"]]
+                it.decision = "NOT_SURE"
                 it.category = "Unparsed"
                 it.highlight = (
                     "AI returned an unparseable response; included for manual review."
                 )
                 it.rationale = "Fallback inclusion to avoid false negatives."
                 rated.append(it)
+            continue
+
+        for r in data.get("items", []):
+            try:
+                rid = int(r.get("id"))
+            except Exception:
+                continue
+            it = id_to_item.get(rid)
+            if not it:
                 continue
 
-            decision = (data.get("decision") or "").strip().upper()
-            if decision not in {"MUST_READ", "SCAN", "SKIP"}:
-                decision = "SCAN"
+            decision = (r.get("decision") or "").strip().upper()
+            if decision not in {"MUST_READ", "GOOD_TO_READ", "NOT_SURE"}:
+                decision = "NOT_SURE"
 
             it.decision = decision
-            it.category = normalize_ws(str(data.get("category") or "General"))
-            it.highlight = normalize_ws(str(data.get("highlight") or ""))
-            it.rationale = normalize_ws(str(data.get("rationale") or ""))
+            it.category = normalize_ws(str(r.get("category") or "General"))
+            it.highlight = normalize_ws(str(r.get("highlight") or ""))
+            it.rationale = normalize_ws(str(r.get("rationale") or ""))
 
-            # keep MUST_READ and SCAN
-            if it.decision in {"MUST_READ", "SCAN"}:
-                rated.append(it)
-            else:
-                pass
-
-        except Exception as e:
-            print(f"[AI] Failed on item '{it.title[:50]}...': {e}")
-            # Safety bias: include as SCAN rather than drop it
-            it.decision = "SCAN"
-            it.category = "AI_Error"
-            it.highlight = "AI error occurred; included for manual review."
-            it.rationale = "Fail-open to avoid missing relevant items."
             rated.append(it)
 
-        # Throttle slightly to reduce rate limit pain
-        time.sleep(1.0)
+        # Extra gentle spacing on top of the global pacing (keeps you well under tight quotas)
+        time.sleep(0.5)
 
-    print(f"[AI] Kept {len(rated)} items (MUST_READ/SCAN) after AI triage.")
+    print(f"[AI] Classified {len(rated)} Academic/Repository items.")
     return rated
 
 
+TREND_SCHEMA = """
+Return ONLY valid JSON:
+{
+  "trends": {
+    "<source_name>": "one short paragraph about the week's themes/trends for this source"
+  }
+}
+""".strip()
+
+
+def ai_trends_one_call(
+    items: List[Item], max_titles_per_source: int = 12
+) -> Dict[str, str]:
+    by_source = defaultdict(list)
+    for it in items:
+        by_source[it.source].append(it)
+
+    payload = {}
+    for src, arr in by_source.items():
+
+        def rank(d: str) -> int:
+            return {"MUST_READ": 0, "GOOD_TO_READ": 1, "NOT_SURE": 2}.get(
+                d or "NOT_SURE", 2
+            )
+
+        arr_sorted = sorted(
+            arr,
+            key=lambda x: (rank(x.decision), x.published_date or dt.date(1900, 1, 1)),
+        )
+        cats = Counter([a.category or "General" for a in arr_sorted]).most_common(6)
+
+        payload[src] = {
+            "n_items": len(arr_sorted),
+            "decision_counts": dict(
+                Counter([a.decision or "NOT_SURE" for a in arr_sorted])
+            ),
+            "top_categories": cats,
+            "top_titles": [a.title for a in arr_sorted[:max_titles_per_source]],
+        }
+
+    prompt = f"""
+You are an expert mining/mineral processing research analyst.
+
+Task:
+For each source in the JSON input, write ONE short paragraph describing the dominant themes/trends across the listed titles/categories.
+Do NOT invent details not supported by the titles/categories. If a source has mixed topics, say so.
+
+Input (JSON):
+{json.dumps(payload, ensure_ascii=False)}
+
+{TREND_SCHEMA}
+""".strip()
+
+    try:
+        text = gemini_generate_with_retry(prompt, max_attempts_per_model=3)
+        data = parse_json_strict(text) or {}
+        trends = (data.get("trends") or {}) if isinstance(data, dict) else {}
+        out = {}
+        for k, v in (trends or {}).items():
+            out[str(k)] = normalize_ws(str(v))
+        return out
+    except Exception as e:
+        print(f"[AI] Trend summary failed (non-fatal): {e}")
+        return {}
+
+
 # =========================
-# Journal / Source Overviews (No AI needed)
+# Deterministic source overviews
 # =========================
 
 
 def build_source_overviews(items: List[Item]) -> Dict[str, dict]:
-    """
-    Builds simple, deterministic overviews per source:
-    - counts
-    - decision breakdown
-    - top categories (from AI)
-    """
     by_source = defaultdict(list)
     for it in items:
         by_source[it.source].append(it)
 
     out = {}
     for src, arr in by_source.items():
-        decisions = Counter([a.decision or "UNKNOWN" for a in arr])
+        decisions = Counter([a.decision or "NOT_SURE" for a in arr])
         cats = Counter([a.category or "General" for a in arr]).most_common(5)
-
         out[src] = {
             "total": len(arr),
             "decisions": dict(decisions),
@@ -895,24 +1136,23 @@ def build_source_overviews(items: List[Item]) -> Dict[str, dict]:
 def render_newsletter_html(
     start: dt.date,
     end: dt.date,
+    repo_start: dt.date,
     collected_counts: Dict[str, int],
     included_counts: Dict[str, int],
     source_overviews: Dict[str, dict],
+    source_trends: Dict[str, str],
     items: List[Item],
 ) -> str:
-    """
-    Simple HTML (no external assets). Items grouped by source, then decision (MUST_READ first).
-    """
-
-    # Sort items
     def decision_rank(d: str) -> int:
-        return {"MUST_READ": 0, "SCAN": 1, "SKIP": 2}.get(d or "SCAN", 1)
+        return {"MUST_READ": 0, "GOOD_TO_READ": 1, "NOT_SURE": 2}.get(
+            d or "NOT_SURE", 2
+        )
 
     items_sorted = sorted(
         items,
         key=lambda x: (
             x.source,
-            decision_rank(x.decision or "SCAN"),
+            decision_rank(x.decision or "NOT_SURE"),
             x.published_date or dt.date(1900, 1, 1),
         ),
         reverse=False,
@@ -923,12 +1163,18 @@ def render_newsletter_html(
 <body style="font-family: Arial, Helvetica, sans-serif; color: #222;">
   <div style="background:#1f2d3d; padding: 18px;">
     <h2 style="color:#fff; margin:0;">⛏️ Weekly Mining & Processing Digest</h2>
-    <div style="color:#cfd8dc; margin-top:6px;">Coverage: {start} → {end}</div>
+    <div style="color:#cfd8dc; margin-top:6px;">
+      Coverage (Journals/RSS): {start} → {end}<br/>
+      Coverage (Repositories): {repo_start} → {end}
+    </div>
   </div>
 
   <div style="padding: 18px;">
     <h3 style="margin-top:0;">Overview</h3>
-    <p>This digest covers literature and news discovered between <b>{start}</b> and <b>{end}</b>.</p>
+    <p>
+      This digest covers journals/RSS between <b>{start}</b> and <b>{end}</b>.
+      Repository sources are scanned over an extended window back to <b>{repo_start}</b> to avoid missing infrequent updates.
+    </p>
 
     <h3>Coverage & Sources</h3>
     <table style="border-collapse: collapse; width: 100%; max-width: 900px;">
@@ -939,7 +1185,6 @@ def render_newsletter_html(
       </tr>
     """
 
-    # Keep stable ordering
     all_sources = sorted(
         set(list(collected_counts.keys()) + list(included_counts.keys()))
     )
@@ -964,6 +1209,7 @@ def render_newsletter_html(
         topcats_str = (
             ", ".join([f"{c} ({n})" for c, n in topcats]) if topcats else "N/A"
         )
+        trend = source_trends.get(src, "")
 
         html += f"""
         <div style="margin-top:14px; padding:10px; border:1px solid #eee; border-radius:8px;">
@@ -971,11 +1217,13 @@ def render_newsletter_html(
           <div style="font-size:13px; color:#555; margin-top:4px;">
             Included: {ov.get("total", 0)} |
             MUST_READ: {decisions.get("MUST_READ", 0)} |
-            SCAN: {decisions.get("SCAN", 0)}
+            GOOD_TO_READ: {decisions.get("GOOD_TO_READ", 0)} |
+            NOT_SURE: {decisions.get("NOT_SURE", 0)}
           </div>
           <div style="font-size:13px; color:#555; margin-top:4px;">
             Top categories: {topcats_str}
           </div>
+          {f'<div style="font-size:13px; color:#333; margin-top:8px;"><b>Trend:</b> {trend}</div>' if trend else ""}
         </div>
         """
 
@@ -987,12 +1235,12 @@ def render_newsletter_html(
             current_source = it.source
             html += f"<h4 style='margin-top:22px; border-bottom:2px solid #efefef; padding-bottom:6px;'>{current_source}</h4>"
 
-        badge = it.decision or "SCAN"
+        badge = it.decision or "NOT_SURE"
         badge_color = {
             "MUST_READ": "#b71c1c",
-            "SCAN": "#ef6c00",
-            "SKIP": "#757575",
-        }.get(badge, "#ef6c00")
+            "GOOD_TO_READ": "#ef6c00",
+            "NOT_SURE": "#757575",
+        }.get(badge, "#757575")
 
         pub = it.published_date.isoformat() if it.published_date else "Unknown date"
         authors = it.authors or "Unknown"
@@ -1044,7 +1292,7 @@ def render_newsletter_html(
 # =========================
 
 
-def send_email(html: str) -> None:
+def send_email(html: str, attachments: List[str]) -> None:
     if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
         raise ValueError(
             "EMAIL_SENDER/EMAIL_PASSWORD/EMAIL_RECEIVER missing. Set them in .env or GitHub Secrets."
@@ -1056,68 +1304,23 @@ def send_email(html: str) -> None:
     msg["To"] = EMAIL_RECEIVER
     msg.attach(MIMEText(html, "html"))
 
+    for path in attachments:
+        if not path or not os.path.exists(path):
+            continue
+        part = MIMEBase("application", "octet-stream")
+        with open(path, "rb") as f:
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header(
+            "Content-Disposition", f'attachment; filename="{os.path.basename(path)}"'
+        )
+        msg.attach(part)
+
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.send_message(msg)
 
-    print("[EMAIL] Sent successfully.")
-
-
-# =========================
-# Tests (run locally)
-# =========================
-
-
-def test_env() -> None:
-    print("\n[TEST] Environment sanity")
-    assert bool(GEMINI_API_KEY), "GEMINI_API_KEY missing"
-    print("[TEST] GEMINI_API_KEY OK")
-    # Email vars may be optional if not testing send:
-    print(f"[TEST] EMAIL_SENDER present? {bool(EMAIL_SENDER)}")
-    print(f"[TEST] EMAIL_RECEIVER present? {bool(EMAIL_RECEIVER)}")
-
-
-def test_openalex_one_journal(journal_name: str) -> None:
-    print(f"\n[TEST] OpenAlex journal test: {journal_name}")
-    sid = openalex_resolve_source_id(journal_name)
-    assert sid, f"Could not resolve OpenAlex source id for {journal_name}"
-    items = fetch_openalex_journal_items(
-        pd.DataFrame([{"type": "journal", "identifier": journal_name}]),
-        START_DATE,
-        END_DATE,
-    )
-    print(f"[TEST] Retrieved {len(items)} items in-window for {journal_name}")
-    if items:
-        print("[TEST] Sample:", items[0].title, items[0].published_date, items[0].url)
-
-
-def test_rss_one_feed(name: str, url: str) -> None:
-    print(f"\n[TEST] RSS test: {name}")
-    df = pd.DataFrame([{"name": name, "type": "rss", "identifier": url}])
-    items = fetch_rss_items(df, START_DATE, END_DATE)
-    print(f"[TEST] RSS kept {len(items)} in-window items")
-    if items:
-        print("[TEST] Sample:", items[0].title, items[0].published_date, items[0].url)
-
-
-def test_onemine(org: str = "AUSIMM") -> None:
-    print(f"\n[TEST] OneMine test org={org}")
-    df = pd.DataFrame(
-        [
-            {
-                "name": f"OneMine {org}",
-                "type": "repository",
-                "identifier": f"onemine:Organization={org}",
-            }
-        ]
-    )
-    items = fetch_onemine_repository_items(
-        df, START_DATE, END_DATE, max_pages=2, page_size=20, keywords=None
-    )
-    print(f"[TEST] OneMine kept {len(items)} in-window items")
-    if items:
-        print("[TEST] Sample:", items[0].title, items[0].published_date, items[0].url)
-        print("[TEST] Abstract length:", len(items[0].abstract or ""))
+    print("[EMAIL] Sent successfully (with attachments).")
 
 
 # =========================
@@ -1129,8 +1332,8 @@ def run_pipeline(
     keywords_csv: str = "keywords.csv",
     sources_csv: str = "sources.csv",
     do_send_email: bool = True,
+    batch_size: int = 6,
 ) -> None:
-    # Inputs
     keywords_path = os.path.join(SCRIPT_DIR, keywords_csv)
     sources_path = os.path.join(SCRIPT_DIR, sources_csv)
 
@@ -1142,98 +1345,84 @@ def run_pipeline(
     keywords_context = load_keywords_csv(keywords_path)
     sources_df = load_sources_csv(sources_path)
 
-    print("\n[PIPELINE] Step 1: Collect items (OpenAlex + RSS + Repositories)")
+    print("\n[PIPELINE] Step 1: Collect items (OpenAlex + RSS + OneMine)")
 
     collected: List[Item] = []
-
-    # Journals via OpenAlex
-    journal_items = fetch_openalex_journal_items(sources_df, START_DATE, END_DATE)
-    collected.extend(journal_items)
-
-    # RSS
-    rss_items = fetch_rss_items(sources_df, START_DATE, END_DATE)
-    collected.extend(rss_items)
-
-    # Repositories (OneMine); optional: use a broad keyword string to focus
-    # If you want keyword filtering at OneMine search level, build it from your topics:
-    # onemine_keywords = " OR ".join(set(",".join(keywords_context.values()).split(",")))  # too broad; not recommended
-    # For now, pull by date window only (best to avoid missing)
-    repo_items = fetch_onemine_repository_items(
-        sources_df, START_DATE, END_DATE, max_pages=3, page_size=20, keywords=None
+    collected.extend(fetch_openalex_journal_items(sources_df, START_DATE, END_DATE))
+    collected.extend(fetch_rss_items(sources_df, START_DATE, END_DATE))
+    collected.extend(
+        fetch_onemine_repository_items(
+            sources_df, REPO_START_DATE, END_DATE, max_pages=6, page_size=20
+        )
     )
-    collected.extend(repo_items)
 
-    print(f"[PIPELINE] Collected in-window total: {len(collected)}")
+    collected = dedupe_items(collected)
+    print(f"[PIPELINE] Collected total (deduped): {len(collected)}")
 
-    # Coverage counts (collected)
-    collected_counts = Counter([i.source for i in collected])
+    # Raw CSV for Academic + Repository
+    raw_items = [i for i in collected if i.source_type in {"Academic", "Repository"}]
+    out_dir = os.path.join(SCRIPT_DIR, "output")
+    os.makedirs(out_dir, exist_ok=True)
 
-    print("\n[PIPELINE] Step 2: AI triage (Gemini) on full abstracts (no truncation)")
-    included = ai_classify_items(collected, keywords_context)
+    raw_csv = os.path.join(out_dir, f"raw_academic_repository_{TODAY}.csv")
+    write_raw_csv(raw_csv, raw_items)
+    print(f"[PIPELINE] Wrote raw CSV: {raw_csv}")
 
-    included_counts = Counter([i.source for i in included])
+    print(
+        "\n[PIPELINE] Step 2: AI triage ONLY for Academic + Repository (token optimisation)"
+    )
+    triaged = ai_classify_items_batched(
+        raw_items, keywords_context, batch_size=batch_size
+    )
+
+    triaged_csv = os.path.join(out_dir, f"triaged_academic_repository_{TODAY}.csv")
+    write_triaged_csv(triaged_csv, triaged)
+    print(f"[PIPELINE] Wrote triaged CSV: {triaged_csv}")
 
     print("\n[PIPELINE] Step 3: Build deterministic source overviews")
-    overviews = build_source_overviews(included)
+    overviews = build_source_overviews(triaged)
+
+    print("\n[PIPELINE] Step 3b: AI trend paragraph per source (single-call, capped)")
+    trends = ai_trends_one_call(triaged, max_titles_per_source=12)
 
     print("\n[PIPELINE] Step 4: Render newsletter")
+    collected_counts = Counter([i.source for i in collected])
+    included_counts = Counter([i.source for i in triaged])
+
     html = render_newsletter_html(
         start=START_DATE,
         end=END_DATE,
+        repo_start=REPO_START_DATE,
         collected_counts=dict(collected_counts),
         included_counts=dict(included_counts),
         source_overviews=overviews,
-        items=included,
+        source_trends=trends,
+        items=triaged,
     )
 
-    # Save local HTML for inspection
-    out_dir = os.path.join(SCRIPT_DIR, "output")
-    os.makedirs(out_dir, exist_ok=True)
     out_html = os.path.join(out_dir, f"digest_{TODAY}.html")
     with open(out_html, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"[PIPELINE] Saved HTML to: {out_html}")
 
-    print("\n[PIPELINE] Step 5: Send email")
+    print("\n[PIPELINE] Step 5: Send email (with CSV attachments)")
     if do_send_email:
-        send_email(html)
+        send_email(html, attachments=[raw_csv, triaged_csv])
     else:
         print("[PIPELINE] Email sending disabled (do_send_email=False).")
 
 
 if __name__ == "__main__":
-    """
-    Local usage examples (VS Code terminal):
-
-    1) Run tests:
-       python daily_digest_GPTV3.py
-
-    2) Run pipeline without sending email:
-       python daily_digest_GPTV3.py --no-email
-
-    3) If you want to run only OneMine test quickly, comment out others or add an arg parser.
-    """
     import sys
 
-    # Basic arg flag
     no_email = "--no-email" in sys.argv
 
-    # ===== Tests =====
-    test_env()
+    batch = 6
+    for arg in sys.argv:
+        if arg.startswith("--batch="):
+            try:
+                batch = int(arg.split("=", 1)[1])
+            except Exception:
+                pass
 
-    # Optional targeted tests (safe defaults)
-    # If you want to test a journal that was missing (e.g., Minerals Engineering):
-    try:
-        test_openalex_one_journal("Minerals Engineering")
-    except AssertionError as e:
-        print(f"[TEST] OpenAlex journal test warning: {e}")
-
-    # Example RSS test (only if you have at least one RSS source in sources.csv)
-    # Uncomment and set an RSS url if needed:
-    # test_rss_one_feed("Mining.com", "https://www.mining.com/feed/")
-
-    # OneMine test (AUSIMM)
-    test_onemine("AUSIMM")
-
-    # ===== Run full pipeline =====
-    run_pipeline(do_send_email=not no_email)
+    run_pipeline(do_send_email=not no_email, batch_size=batch)
