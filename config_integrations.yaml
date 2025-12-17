@@ -1,0 +1,123 @@
+# -----------------------------------------------------------------------------
+# Source integrations configuration (beyond OpenAlex journals + OneMine repos)
+#
+# Goal:
+# - Keep your main config.yaml small (window + email + Gemini pacing).
+# - Put per-source API settings, rate limits, and query behavior here.
+#
+# Notes:
+# - Any *_env values refer to environment variables (set via .env or GitHub Secrets).
+# - All "enabled" flags default to false for new sources; turn them on one-by-one.
+# - Date windowing:
+#     - canonical window = lookback_days
+#     - repositories can extend by repository_extra_days
+#     - other sources can optionally extend via extra_days
+# -----------------------------------------------------------------------------
+
+project:
+  # Canonical lookback window (days). Keep in sync with your main config.yaml.
+  lookback_days: 7
+
+  # Repositories (e.g., OneMine) should look further back than journals.
+  repository_extra_days: 30
+
+  # Where outputs go (HTML + CSVs)
+  output_dir: "output"
+
+dedupe:
+  # De-duplication priority. DOI beats everything, then URL, then title+year.
+  prefer_keys: ["doi", "url", "title_year"]
+
+  # When two records collide, keep metadata from the earlier source in this list.
+  # (OpenAlex usually has better abstracts + stable IDs; others fill gaps.)
+  prefer_sources: ["openalex", "crossref", "semantic_scholar", "lens", "arxiv", "ausimm"]
+
+openalex:
+  enabled: true
+  # Journals are still driven from sources.csv where type=journal.
+  per_journal_max_results: 5
+  polite_pool_email_env: "OPENALEX_MAILTO"   # optional but recommended
+  timeout_seconds: 30
+
+crossref:
+  enabled: false
+  # Crossref asks for a contact email (polite usage).
+  mailto_env: "CROSSREF_MAILTO"              # optional but strongly recommended
+  # Use keywords.csv to form Crossref queries (unless you explicitly list queries below).
+  query_mode: "keywords_csv"                 # keywords_csv | explicit_queries
+  explicit_queries: []                       # used when query_mode=explicit_queries
+  # Crossref doesn't reliably support strict published-date filtering for all records,
+  # so we fetch and then filter locally by published date when possible.
+  extra_days: 0                              # set >0 if you want Crossref to look further back than lookback_days
+  max_results_per_query: 50
+  min_interval_seconds: 1.0
+  timeout_seconds: 30
+  filters:
+    type: "journal-article"                  # common: journal-article, proceedings-article, posted-content
+
+semantic_scholar:
+  enabled: false
+  # API key is optional but improves quota for many users.
+  api_key_env: "SEMANTIC_SCHOLAR_API_KEY"    # optional
+  query_mode: "keywords_csv"
+  explicit_queries: []
+  extra_days: 0
+  max_results_per_query: 50
+  # Fields to request (keep tight to reduce bandwidth).
+  fields: ["title","authors","abstract","url","externalIds","publicationDate","venue","journal","year"]
+  min_interval_seconds: 2.0
+  timeout_seconds: 30
+
+lens:
+  enabled: false
+  # Lens requires an API token/key.
+  api_key_env: "LENS_API_KEY"                # REQUIRED if enabled
+  query_mode: "keywords_csv"
+  explicit_queries: []
+  extra_days: 0
+  max_results_per_query: 50
+  include_patents: false                     # keep false for your use-case
+  min_interval_seconds: 2.0
+  timeout_seconds: 30
+
+arxiv:
+  enabled: false
+  # arXiv uses categories + free-text query; no key.
+  query_mode: "keywords_csv"
+  explicit_queries: []
+  categories: ["cs.SY","eess.SY","cs.RO"]    # edit to match your scope
+  extra_days: 0
+  max_results_per_query: 50
+  min_interval_seconds: 1.0
+  timeout_seconds: 30
+
+ausimm:
+  enabled: false
+  # AusIMM Digital Library may not have an official public API.
+  # Choose one:
+  #  - scrape_public_search: only if pages are publicly accessible
+  #  - rss: if AusIMM offers RSS for what you need
+  mode: "scrape_public_search"               # scrape_public_search | rss
+  base_url: "https://ausimm.com/publications/digital-library"
+  requires_login: false                      # set true if your access needs membership login (not supported in headless GH Actions by default)
+  query_mode: "keywords_csv"
+  explicit_queries: []
+  extra_days: 0
+  max_results_per_query: 50
+  min_interval_seconds: 2.0
+  timeout_seconds: 30
+
+ai:
+  # These are already in your main config.yaml, but keeping them here allows per-project overrides.
+  # If both files define them, the main config.yaml should win.
+  gemini_min_interval_seconds: 2.0
+  gemini_error_sleep_seconds: 10.0
+
+  # Default batching for the triage step (kept small to reduce 429s).
+  batch_size: 6
+
+testing:
+  # When true, each connector should cap work aggressively (few queries, few results).
+  # Useful for quick smoke tests.
+  smoke_test_mode: false
+  smoke_test_max_total_items: 20
