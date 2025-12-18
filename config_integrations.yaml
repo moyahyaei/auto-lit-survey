@@ -40,7 +40,7 @@ openalex:
   timeout_seconds: 30
 
 crossref:
-  enabled: false
+  enabled: true
   # Crossref asks for a contact email (polite usage).
   mailto_env: "CROSSREF_MAILTO"              # optional but strongly recommended
   # Use keywords.csv to form Crossref queries (unless you explicitly list queries below).
@@ -81,7 +81,7 @@ lens:
   timeout_seconds: 30
 
 arxiv:
-  enabled: false
+  enabled: true
   # arXiv uses categories + free-text query; no key.
   query_mode: "keywords_csv"
   explicit_queries: []
@@ -92,7 +92,7 @@ arxiv:
   timeout_seconds: 30
 
 ausimm:
-  enabled: false
+  enabled: true
   # AusIMM Digital Library may not have an official public API.
   # Choose one:
   #  - scrape_public_search: only if pages are publicly accessible
