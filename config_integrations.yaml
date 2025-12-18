@@ -56,7 +56,7 @@ crossref:
     type: "journal-article"                  # common: journal-article, proceedings-article, posted-content
 
 semantic_scholar:
-  enabled: false
+  enabled: true
   # API key is optional but improves quota for many users.
   api_key_env: "SEMANTIC_SCHOLAR_API_KEY"    # optional
   query_mode: "keywords_csv"

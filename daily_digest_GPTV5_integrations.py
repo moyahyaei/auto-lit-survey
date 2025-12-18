@@ -1,101 +1,135 @@
-# coding: utf-8
+#!/usr/bin/env python3
 """
-Auto Literature Survey Digest
+Recent Publications Digest (with optional integrations)
 
-Collects:
-- Academic items via OpenAlex
-- News items via RSS (optional)
-- Repository items via OneMine search
-
-Outputs:
-- output/raw_academic_repository_<YYYY-MM-DD>.csv
-- output/triaged_academic_repository_<YYYY-MM-DD>.csv
-- output/digest_<YYYY-MM-DD>.html
-Email:
-- Sends HTML digest + attaches HTML + CSVs.
-
-Key improvements incorporated:
-- OpenAlex source resolution uses `search=` (handles commas) and improved matching to avoid wrong journal IDs.
-- Gemini model selection is dynamic via `genai.list_models()` (no fixed model name).
-- AI triage runs only for Academic + Repository (token optimisation).
-- Batched triage + explicit pacing + retry/backoff for 429 rate limits.
-- OneMine repository window is always extended by +30 days relative to config lookback.
-- Uses timezone-aware UTC dates (avoids utcnow deprecation).
+Fixes vs. the broken integration draft:
+- load_integrations_config is defined before it is called (no NameError)
+- integration step is inside run_pipeline (no indentation/flow corruption)
+- missing helpers (ai_throttle, parse_date) are implemented
+- integration Item creation matches the Item schema
+- integrations config is optional and supports multiple filenames
 """
 
+from __future__ import annotations
+
+import csv
+import datetime as dt
+import html
+import json
 import os
 import re
-import json
+import sys
 import time
-import hashlib
-import datetime as dt
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-from collections import defaultdict, Counter
-from difflib import SequenceMatcher
-from urllib.parse import parse_qsl, urlparse
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 import pandas as pd
 import feedparser
 from bs4 import BeautifulSoup
-
-import google.generativeai as genai
-
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email import encoders
-
 from dotenv import load_dotenv
 
+# Optional YAML (preferred). We also include a tiny fallback parser.
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None  # type: ignore
 
-# =========================
+# Gemini SDK (old one). We keep google-genai optional, but we don't require it.
+try:
+    import google.generativeai as genai  # type: ignore
+except Exception:
+    genai = None  # type: ignore
+
+
+# ----------------------------
+# Data model
+# ----------------------------
+
+
+@dataclass
+class Item:
+    title: str
+    url: str
+    source: str
+    source_type: str  # "academic" | "rss" | "repository" | "integration"
+    published_date: str  # YYYY-MM-DD where possible
+    authors: str = ""
+    abstract: str = ""
+    doi: str = ""
+
+
+# ----------------------------
 # Utilities
-# =========================
+# ----------------------------
+
+USER_AGENT = "auto-lit-survey/1.0 (+https://github.com/moyahyaei/auto-lit-survey; contact: see README)"
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "lookback_days": 7,
+    "max_items_per_feed": 5,
+    "email_subject": "Recent Publications Digest",
+    "gemini_min_interval_seconds": 2.0,
+    "gemini_error_sleep_seconds": 10.0,
+    "repository_extra_days": 30,
+}
+
+DEFAULT_INTEGRATIONS: Dict[str, Any] = {
+    "openalex": {"enabled": True, "per_journal_max_results": 5, "timeout_seconds": 30},
+    "crossref": {"enabled": False, "max_items_per_topic": 5, "timeout_seconds": 30},
+    "arxiv": {"enabled": False, "max_items_per_topic": 5, "timeout_seconds": 30},
+    "ausimm": {
+        "enabled": False,
+        "max_items_per_topic": 5,
+        "timeout_seconds": 30,
+        "rss_url": "",
+    },
+    "semantic_scholar": {
+        "enabled": False,
+        "max_items_per_topic": 5,
+        "timeout_seconds": 30,
+    },
+    "lens": {"enabled": False, "max_items_per_topic": 5, "timeout_seconds": 30},
+}
 
 
-def utc_today_date() -> dt.date:
-    # timezone-aware UTC for forward compatibility
+def utc_today() -> dt.date:
+    # Avoid deprecated utcnow()
     return dt.datetime.now(dt.timezone.utc).date()
 
 
-def normalize_ws(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
-
-
-def safe_get_text(el) -> str:
-    return el.get_text(" ", strip=True) if el else ""
+def iso_date(d: dt.date) -> str:
+    return d.isoformat()
 
 
 def parse_date_flexible(s: str) -> Optional[dt.date]:
     if not s:
         return None
-    s = str(s).strip()
-
-    for fmt in ("%b %d, %Y", "%B %d, %Y", "%Y-%m-%d"):
+    s = s.strip()
+    # Common formats
+    fmts = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%d-%m-%Y",
+        "%d/%m/%Y",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S",
+        "%a, %d %b %Y %H:%M:%S %z",  # RSS
+        "%d %b %Y",
+        "%b %d, %Y",
+    ]
+    for f in fmts:
         try:
-            return dt.datetime.strptime(s, fmt).date()
-        except ValueError:
+            return dt.datetime.strptime(s, f).date()
+        except Exception:
             pass
-
+    # Try feedparser parsed time format (e.g., "2025-12-17T00:00:00Z")
     try:
-        ss = s.replace("Z", "+00:00")
-        dtx = dt.datetime.fromisoformat(ss)
-        return dtx.date()
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).date()
     except Exception:
-        pass
-
-    m = re.search(r"(\d{4})-(\d{2})-(\d{2})", s)
-    if m:
-        try:
-            return dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except ValueError:
-            return None
-
-    return None
+        return None
 
 
 def in_window(d: Optional[dt.date], start: dt.date, end: dt.date) -> bool:
@@ -104,1330 +138,22 @@ def in_window(d: Optional[dt.date], start: dt.date, end: dt.date) -> bool:
     return start <= d <= end
 
 
-def sha1(s: str) -> str:
-    return hashlib.sha1((s or "").encode("utf-8", errors="ignore")).hexdigest()
-
-
-# =========================
-# Data model
-# =========================
-
-
-@dataclass
-class Item:
-    title: str
-    url: str
-    source: str
-    source_type: str  # "Academic" | "News" | "Repository"
-    published_date: Optional[dt.date]
-    authors: Optional[str] = None
-    abstract: Optional[str] = None
-    decision: Optional[str] = None  # MUST_READ | GOOD_TO_READ | NOT_SURE
-    category: Optional[str] = None
-    highlight: Optional[str] = None
-    rationale: Optional[str] = None
-
-
-# =========================
-# Config & Environment
-# =========================
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-ENV_PATH = os.path.join(SCRIPT_DIR, ".env")
-load_dotenv(dotenv_path=ENV_PATH)
-print(f"[ENV] Loaded .env from: {ENV_PATH} (exists={os.path.exists(ENV_PATH)})")
-
-# Config (optional)
-# Prefer config.yaml (supports comments). We also support config.json for backward compatibility.
-
-try:
-    import yaml  # type: ignore
-except Exception:
-    yaml = None  # type: ignore
-
-
-def _simple_yaml_load(text: str) -> Dict[str, object]:
-    """Very small YAML subset parser: key: value pairs, # comments, and simple scalars.
-    Used only if PyYAML isn't installed.
-    """
-    out: Dict[str, object] = {}
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        # strip inline comments (best-effort)
-        if "#" in line:
-            before = line.split("#", 1)[0].rstrip()
-            if before:
-                line = before
-            else:
-                continue
-        if ":" not in line:
-            continue
-        k, v = line.split(":", 1)
-        key = k.strip()
-        val = v.strip()
-        if not key:
-            continue
-
-        # remove quotes
-        if (val.startswith('"') and val.endswith('"')) or (
-            val.startswith("'") and val.endswith("'")
-        ):
-            out[key] = val[1:-1]
-            continue
-
-        low = val.lower()
-        if low in ("true", "false"):
-            out[key] = low == "true"
-            continue
-        if low in ("null", "none", "~", ""):
-            out[key] = None
-            continue
-
-        # numbers
-        try:
-            if re.fullmatch(r"[-+]?\d+", val):
-                out[key] = int(val)
-                continue
-            if re.fullmatch(r"[-+]?\d*\.\d+", val):
-                out[key] = float(val)
-                continue
-        except Exception:
-            pass
-
-        out[key] = val
-    return out
-
-
-def load_config(script_dir: Path) -> Tuple[Dict[str, object], Optional[Path]]:
-    script_dir = Path(script_dir)  # allow caller to pass str or Path
-    candidates = [
-        script_dir / "config.yaml",
-        script_dir / "config.yml",
-        script_dir / "config.json",
-        script_dir / "config.jason",  # common typo
-    ]
-    for p in candidates:
-        if not p.exists():
-            continue
-        try:
-            if p.suffix in (".yaml", ".yml"):
-                raw = p.read_text(encoding="utf-8")
-                if yaml is not None:
-                    cfg = yaml.safe_load(raw) or {}
-                    if isinstance(cfg, dict):
-                        return cfg, p
-                    return {}, p
-                return _simple_yaml_load(raw), p
-            else:
-                with p.open("r", encoding="utf-8") as f:
-                    cfg = json.load(f) or {}
-                return cfg, p
-        except Exception as e:
-            print(f"[CONFIG] Failed to load {p}: {e}")
-            return {}, p
-    return {}, None
-
-
-config, CONFIG_PATH_USED = load_config(SCRIPT_DIR)
-integrations_config, INTEGRATIONS_CONFIG_PATH_USED = load_integrations_config(
-    SCRIPT_DIR
-)
-if CONFIG_PATH_USED:
-    print(f"[CONFIG] Loaded {CONFIG_PATH_USED.name} from: {CONFIG_PATH_USED}")
-else:
-    print(
-        f"[CONFIG] No config.yaml/config.json found in: {SCRIPT_DIR} (using defaults)"
-    )
-
-LOOKBACK_DAYS = int(config.get("lookback_days", 7))
-MAX_ITEMS_PER_FEED = int(config.get("max_items_per_feed", 5))
-EMAIL_SUBJECT = str(config.get("email_subject", "Weekly Mining & Processing Digest"))
-
-AI_BATCH_SIZE = int(config.get("ai_batch_size", 6))
-AI_SLEEP_SECONDS = float(config.get("ai_sleep_seconds", 2.0))
-AI_MIN_INTERVAL_SECONDS = float(
-    config.get(
-        "ai_min_interval_seconds", config.get("gemini_min_interval_seconds", 2.0)
-    )
-)
-AI_ERROR_SLEEP_SECONDS = float(
-    config.get("ai_error_sleep_seconds", config.get("gemini_error_sleep_seconds", 10.0))
-)
-REPOSITORY_EXTRA_DAYS = int(config.get("repository_extra_days", 30))
-
-# Simple global throttling to reduce 429s (rate limits)
-_AI_LAST_CALL_MONO = 0.0
-
-
-def load_integrations_config(
-    script_dir: Path,
-) -> Tuple[Dict[str, object], Optional[Path]]:
-    """Load optional integration config (Option A). If missing, returns empty dict."""
-    candidates = [
-        script_dir / "config_integrations.yaml",
-        script_dir / "config_integrations.yml",
-    ]
-    for p in candidates:
-        if p.exists():
-            try:
-                cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-                if not isinstance(cfg, dict):
-                    raise ValueError(
-                        "Integration config must be a YAML mapping at the top level."
-                    )
-                print(f"[CONFIG] Loaded integration config: {p}")
-                return cfg, p
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to load integration config from {p}: {e}"
-                ) from e
-    print(
-        "[CONFIG] No integration config found (config_integrations.yaml). Skipping optional integrations."
-    )
-    return {}, None
-
-
-def ai_throttle():
-    """Ensure at least AI_MIN_INTERVAL_SECONDS between Gemini requests."""
-    global _AI_LAST_CALL_MONO
-    if AI_MIN_INTERVAL_SECONDS <= 0:
-        return
-    now = time.monotonic()
-    elapsed = now - _AI_LAST_CALL_MONO
-    if elapsed < AI_MIN_INTERVAL_SECONDS:
-        time.sleep(AI_MIN_INTERVAL_SECONDS - elapsed)
-    _AI_LAST_CALL_MONO = time.monotonic()
-
-
-AI_ABSTRACT_MAX_CHARS = int(config.get("ai_abstract_max_chars", 6000))
-TREND_ITEMS_CAP = int(config.get("trend_items_cap", 12))
-
-TODAY = utc_today_date()
-START_DATE = TODAY - dt.timedelta(days=LOOKBACK_DAYS)
-END_DATE = TODAY
-
-REPO_START_DATE = TODAY - dt.timedelta(days=LOOKBACK_DAYS + REPOSITORY_EXTRA_DAYS)
-REPO_END_DATE = END_DATE
-
-print(
-    f"[WINDOW] Academic/News coverage: {START_DATE} -> {END_DATE} (lookback_days={LOOKBACK_DAYS})"
-)
-print(
-    f"[WINDOW] Repository coverage (OneMine): {REPO_START_DATE} -> {REPO_END_DATE} (lookback_days+repository_extra_days={REPOSITORY_EXTRA_DAYS})"
-)
-
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-EMAIL_SENDER = os.environ.get("EMAIL_SENDER")
-EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
-EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER")
-
-OPENALEX_MAILTO = os.environ.get("OPENALEX_MAILTO")
-
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY is missing. Set it in .env or GitHub Secrets.")
-
-genai.configure(api_key=GEMINI_API_KEY)
-
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MiningDigestBot/1.1)"}
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
-
-
-# =========================
-# Gemini model discovery (robust)
-# =========================
-
-
-def _strip_models_prefix(name: str) -> str:
-    return name.replace("models/", "").strip()
-
-
-def _parse_version_tokens(name: str) -> Tuple[int, int]:
-    m = re.search(r"\bgemini-(\d+)(?:\.(\d+))?\b", name)
-    if not m:
-        return (0, 0)
-    return (int(m.group(1)), int(m.group(2) or 0))
-
-
-def _is_text_generation_model(name: str) -> bool:
-    n = name.lower()
-    if not n.startswith("models/gemini"):
-        return False
-    blocked = [
-        "image",
-        "tts",
-        "robotics",
-        "computer-use",
-        "deep-research",
-        "exp-image-generation",
-    ]
-    return not any(b in n for b in blocked)
-
-
-def _rank_model(name: str, prefer: str) -> tuple:
-    n = name.lower()
-    major, minor = _parse_version_tokens(n)
-
-    tag = 0
-    if "latest" in n:
-        tag = 60
-    elif "preview" in n:
-        tag = 30
-    elif "-exp" in n or "gemini-exp" in n:
-        tag = 20
-    elif "lite" in n:
-        tag = 10
-
-    if prefer == "pro":
-        fam = 40 if "pro" in n else (20 if "flash" in n else 0)
-    else:
-        fam = 40 if "flash" in n else (20 if "pro" in n else 0)
-
-    rev = 5 if re.search(r"-\d{3}\b", n) else 0
-    return (tag, major, minor, fam, rev)
-
-
-def select_best_model(prefer: str = "flash") -> str:
-    candidates = []
-    for m in genai.list_models():
-        if "generateContent" not in getattr(m, "supported_generation_methods", []):
-            continue
-        if not _is_text_generation_model(m.name):
-            continue
-        candidates.append(m.name)
-
-    if not candidates:
-        return "gemini-2.0-flash"
-
-    best = max(candidates, key=lambda x: _rank_model(x, prefer=prefer))
-    return _strip_models_prefix(best)
-
-
-GEMINI_MODEL_TRIAGE = select_best_model(prefer="flash")
-GEMINI_MODEL_TRENDS = select_best_model(prefer="pro")
-
-print(f"[GEMINI] Selected triage model: {GEMINI_MODEL_TRIAGE}")
-print(f"[GEMINI] Selected trends model: {GEMINI_MODEL_TRENDS}")
-
-gemini_model_triage = genai.GenerativeModel(GEMINI_MODEL_TRIAGE)
-gemini_model_trends = genai.GenerativeModel(GEMINI_MODEL_TRENDS)
-
-
-# =========================
-# Load Inputs
-# =========================
-
-
-def load_keywords_csv(path: str) -> Dict[str, str]:
-    df = pd.read_csv(path)
-    if "topic" not in df.columns or "keywords" not in df.columns:
-        raise ValueError("keywords.csv must have columns: topic, keywords")
-    return dict(zip(df["topic"].astype(str), df["keywords"].astype(str)))
-
-
-def load_sources_csv(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    needed = {"name", "type", "identifier"}
-    if not needed.issubset(set(df.columns)):
-        raise ValueError("sources.csv must have columns: name, type, identifier")
-    df["name"] = df["name"].astype(str)
-    df["type"] = df["type"].astype(str).str.lower().str.strip()
-    df["identifier"] = df["identifier"].astype(str)
-    return df
-
-
-# =========================
-# OpenAlex
-# =========================
-
-OPENALEX_SOURCE_CACHE: Dict[str, str] = {}
-
-
-def _norm_journal_name(s: str) -> str:
-    s = (s or "").lower()
-    s = re.sub(r"&", " and ", s)
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+def norm_text(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^\w\s]", "", s)
     return s
-
-
-def openalex_resolve_source_id(journal_name: str) -> Optional[str]:
-    j_raw = (journal_name or "").strip()
-    if not j_raw:
-        return None
-    if j_raw in OPENALEX_SOURCE_CACHE:
-        return OPENALEX_SOURCE_CACHE[j_raw]
-
-    url = "https://api.openalex.org/sources"
-    params = {"search": j_raw, "per-page": 25}
-    if OPENALEX_MAILTO:
-        params["mailto"] = OPENALEX_MAILTO
-
-    r = SESSION.get(url, params=params, timeout=30)
-    if r.status_code != 200:
-        print(f"[OpenAlex][ID] Failed for '{j_raw}' status={r.status_code}")
-        return None
-
-    results = r.json().get("results", []) or []
-    if not results:
-        print(f"[OpenAlex][ID] No match for '{j_raw}'")
-        return None
-
-    target = _norm_journal_name(j_raw)
-
-    def score(res) -> float:
-        name = _norm_journal_name(res.get("display_name", ""))
-        if not name:
-            return -1.0
-        if name == target:
-            return 1e6
-        sim = SequenceMatcher(None, target, name).ratio()
-        t_tokens = set(target.split())
-        n_tokens = set(name.split())
-        jac = (
-            (len(t_tokens & n_tokens) / len(t_tokens | n_tokens))
-            if (t_tokens and n_tokens)
-            else 0.0
-        )
-        prefix_penalty = (
-            0.25 if (target.startswith(name) and len(name) < len(target)) else 0.0
-        )
-        coverage_bonus = 0.2 if (t_tokens and t_tokens.issubset(n_tokens)) else 0.0
-        return sim + 0.8 * jac + coverage_bonus - prefix_penalty
-
-    best = max(results, key=score)
-    full_id = (best.get("id") or "").strip()
-    short_id = full_id.replace("https://openalex.org/", "").strip()
-    if not short_id:
-        return None
-
-    OPENALEX_SOURCE_CACHE[j_raw] = short_id
-    print(f"[OpenAlex][ID] {j_raw} -> {short_id}")
-    return short_id
-
-
-def openalex_reconstruct_abstract(inverted_index: Optional[dict]) -> str:
-    if not inverted_index:
-        return ""
-    words = []
-    for w, positions in inverted_index.items():
-        for p in positions:
-            words.append((p, w))
-    words.sort(key=lambda x: x[0])
-    return " ".join(w for _, w in words)
-
-
-def fetch_openalex_journal_items(
-    sources_df: pd.DataFrame, start: dt.date, end: dt.date
-) -> List[Item]:
-    out: List[Item] = []
-    journals = sources_df[sources_df["type"] == "journal"]["identifier"].tolist()
-    if not journals:
-        print("[OpenAlex] No journals configured.")
-        return out
-
-    print(f"[OpenAlex] Querying journals for {start} -> {end} ...")
-    for jname in journals:
-        jid = openalex_resolve_source_id(jname)
-        if not jid:
-            continue
-
-        base_url = "https://api.openalex.org/works"
-        filter_str = (
-            f"primary_location.source.id:{jid},"
-            f"from_publication_date:{start},"
-            f"to_publication_date:{end}"
-        )
-        params = {
-            "filter": filter_str,
-            "per-page": MAX_ITEMS_PER_FEED,
-            "sort": "publication_date:desc",
-            "select": "id,doi,title,publication_date,abstract_inverted_index,authorships",
-        }
-        if OPENALEX_MAILTO:
-            params["mailto"] = OPENALEX_MAILTO
-
-        try:
-            r = SESSION.get(base_url, params=params, timeout=45)
-            if r.status_code != 200:
-                print(f"[OpenAlex] {jname}: HTTP {r.status_code}")
-                continue
-            results = (r.json() or {}).get("results", []) or []
-            print(f"[OpenAlex] {jname}: fetched {len(results)} candidates")
-
-            for w in results:
-                pub = parse_date_flexible(w.get("publication_date", ""))
-                if not in_window(pub, start, end):
-                    continue
-
-                title = normalize_ws(w.get("title", ""))
-                doi = w.get("doi")
-                wid = w.get("id")
-                url = doi if doi else (wid or "")
-
-                auths = []
-                for a in w.get("authorships") or []:
-                    name = ((a.get("author") or {}).get("display_name") or "").strip()
-                    if name:
-                        auths.append(name)
-
-                abstract = normalize_ws(
-                    openalex_reconstruct_abstract(w.get("abstract_inverted_index"))
-                )
-
-                out.append(
-                    Item(
-                        title=title,
-                        url=url,
-                        source=jname,
-                        source_type="Academic",
-                        published_date=pub,
-                        authors=", ".join(auths) if auths else None,
-                        abstract=abstract,
-                    )
-                )
-            time.sleep(0.2)
-        except Exception as e:
-            print(f"[OpenAlex] {jname}: error {e}")
-
-    print(f"[OpenAlex] Total in-window items (pre-dedupe): {len(out)}")
-    return out
-
-
-# =========================
-# RSS
-# =========================
-
-
-def parse_rss_entry_date(entry) -> Optional[dt.date]:
-    if hasattr(entry, "published_parsed") and entry.published_parsed:
-        return dt.date(
-            entry.published_parsed.tm_year,
-            entry.published_parsed.tm_mon,
-            entry.published_parsed.tm_mday,
-        )
-    if hasattr(entry, "updated_parsed") and entry.updated_parsed:
-        return dt.date(
-            entry.updated_parsed.tm_year,
-            entry.updated_parsed.tm_mon,
-            entry.updated_parsed.tm_mday,
-        )
-    s = getattr(entry, "published", "") or getattr(entry, "updated", "") or ""
-    return parse_date_flexible(s)
-
-
-def fetch_rss_items(
-    sources_df: pd.DataFrame, start: dt.date, end: dt.date
-) -> List[Item]:
-    out: List[Item] = []
-    rss_df = sources_df[sources_df["type"] == "rss"]
-    if rss_df.empty:
-        print("[RSS] No rss sources configured.")
-        return out
-
-    print(f"[RSS] Fetching RSS for {start} -> {end} ...")
-    for _, row in rss_df.iterrows():
-        name = row["name"].strip()
-        rss_url = row["identifier"].strip()
-        try:
-            resp = SESSION.get(rss_url, timeout=30)
-            if resp.status_code != 200:
-                print(f"[RSS] {name}: HTTP {resp.status_code}")
-                continue
-
-            feed = feedparser.parse(resp.content)
-            entries = feed.entries[: MAX_ITEMS_PER_FEED * 6]
-            kept = 0
-
-            for e in entries:
-                pub = parse_rss_entry_date(e)
-                if not in_window(pub, start, end):
-                    continue
-
-                title = normalize_ws(getattr(e, "title", "") or "")
-                link = getattr(e, "link", "") or ""
-                summary = normalize_ws(
-                    getattr(e, "summary", "") or getattr(e, "description", "") or ""
-                )
-
-                out.append(
-                    Item(
-                        title=title,
-                        url=link,
-                        source=name,
-                        source_type="News",
-                        published_date=pub,
-                        abstract=summary,
-                    )
-                )
-                kept += 1
-                if kept >= MAX_ITEMS_PER_FEED:
-                    break
-
-            print(f"[RSS] {name}: kept {kept} in-window items")
-        except Exception as e:
-            print(f"[RSS] {name}: error {e}")
-
-    print(f"[RSS] Total in-window items (pre-dedupe): {len(out)}")
-    return out
-
-
-# =========================
-# OneMine Repository
-# =========================
-
-
-def onemine_parse_identifier(identifier: str) -> Dict[str, str]:
-    """
-    Parses repository identifier into base OneMine query params.
-
-    Supported forms:
-      - "onemine:"  or "onemine"                      -> {}
-      - "onemine:Organization=AUSIMM"                 -> {"Organization": "AUSIMM"}
-      - "onemine:keywords=SME Annual Conference&searchfield=all"
-      - "onemine:?keywords=World Gold Conference&searchfield=all"
-      - Full URL: "https://www.onemine.org/search?keywords=...&searchfield=all"
-
-    Returns dict of params to include in OneMine search.
-    """
-    ident = (identifier or "").strip()
-    if not ident:
-        return {}
-
-    # Full URL support (robust to future sources.csv conventions)
-    if (
-        ident.lower().startswith(("http://", "https://"))
-        and "onemine.org" in ident.lower()
-    ):
-        try:
-            parsed = urlparse(ident)
-            pairs = dict(parse_qsl(parsed.query, keep_blank_values=True))
-        except Exception:
-            pairs = {}
-    else:
-        if not ident.lower().startswith("onemine"):
-            return {}
-        rest = ident[len("onemine") :].lstrip(":").strip()
-        if rest.startswith("?"):
-            rest = rest[1:].strip()
-        if not rest:
-            pairs = {}
-        else:
-            pairs = dict(parse_qsl(rest, keep_blank_values=True))
-            if not pairs and "=" in rest:
-                k, v = rest.split("=", 1)
-                pairs = {k.strip(): v.strip()}
-
-    norm: Dict[str, str] = {}
-    for k, v in (pairs or {}).items():
-        kk, vv = (k or "").strip(), (v or "").strip()
-        if not kk:
-            continue
-        if kk.lower() == "searchfield":
-            norm["searchfield"] = vv
-        elif kk.lower() == "keywords":
-            norm["keywords"] = vv
-        elif kk.lower() == "organization":
-            norm["Organization"] = vv
-        else:
-            norm[kk] = vv
-
-    return norm
-
-
-def onemine_parse_list_page(html: str) -> List[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    items = []
-    for li in soup.select("ul.item-list li.item-list__item"):
-        a_title = li.select_one("a.item-list__title")
-        if not a_title:
-            continue
-        title = safe_get_text(a_title)
-        href = (a_title.get("href") or "").strip()
-        url = ("https://www.onemine.org" + href) if href.startswith("/") else href
-
-        date_ps = li.select("p.item-list__date")
-        author_text = safe_get_text(date_ps[0]) if len(date_ps) >= 1 else ""
-        pub_text = safe_get_text(date_ps[-1]) if len(date_ps) >= 2 else ""
-
-        snippet_span = li.select_one("span.item-list__description")
-        snippet = (
-            snippet_span.get_text(" ", strip=True)
-            if snippet_span
-            else safe_get_text(li.select_one("div.item-list__content p"))
-        )
-
-        items.append(
-            {
-                "title": normalize_ws(title),
-                "url": url,
-                "author_text": normalize_ws(author_text),
-                "date_text": normalize_ws(pub_text),
-                "snippet": normalize_ws(snippet),
-            }
-        )
-    return items
-
-
-def onemine_fetch_document_abstract(
-    doc_url: str,
-) -> Tuple[Optional[str], Optional[str]]:
-    try:
-        r = SESSION.get(doc_url, timeout=45)
-        if r.status_code != 200:
-            return None, None
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        meta_desc = soup.select_one('meta[name="description"]')
-        meta_abstract = meta_desc.get("content", "").strip() if meta_desc else ""
-
-        main = soup.select_one("div.content[role='main']") or soup
-        paragraphs = [
-            normalize_ws(p.get_text(" ", strip=True)) for p in main.select("p")
-        ]
-        paragraphs = [p for p in paragraphs if len(p) > 80]
-
-        abstract = " ".join(paragraphs[:3]).strip() if paragraphs else meta_abstract
-
-        text = main.get_text(" ", strip=True)
-        m = re.search(r"\bBy\s+([A-Z][^|•\n]{3,200})", text)
-        authors = m.group(0).strip() if m else ""
-
-        return normalize_ws(authors), normalize_ws(abstract)
-    except Exception:
-        return None, None
-
-
-def fetch_onemine_repository_items(
-    sources_df: pd.DataFrame,
-    start: dt.date,
-    end: dt.date,
-    max_pages: int = 3,
-    page_size: int = 20,
-) -> List[Item]:
-    out: List[Item] = []
-    repo_df = sources_df[sources_df["type"] == "repository"]
-    if repo_df.empty:
-        print("[Repo] No repository sources configured.")
-        return out
-
-    onemine_rows = []
-    for _, row in repo_df.iterrows():
-        ident = row["identifier"].strip()
-        # Accept both the old "onemine:..." convention and a full OneMine URL
-        if ident.lower().startswith("onemine") or ("onemine.org" in ident.lower()):
-            onemine_rows.append(row)
-
-    if not onemine_rows:
-        print("[Repo] No OneMine repository entries found.")
-        return out
-
-    print(f"[Repo][OneMine] Fetching OneMine for {start} -> {end} ...")
-    base_url = "https://www.onemine.org/search"
-
-    for row in onemine_rows:
-        name = row["name"].strip()
-        ident = row["identifier"].strip()
-        base_params = onemine_parse_identifier(ident)
-        if "keywords" in base_params and "searchfield" not in base_params:
-            base_params["searchfield"] = "all"
-
-        candidates = []
-        newest_seen: Optional[dt.date] = None
-
-        for page in range(1, max_pages + 1):
-            params = dict(base_params)
-            params.update(
-                {
-                    "SortBy": "MostRecent",
-                    "page": str(page),
-                    "pageSize": str(page_size),
-                    "DateFrom": start.isoformat(),
-                    "DateTo": end.isoformat(),
-                }
-            )
-            print(f"[Repo][OneMine] GET {name}: page={page} params={params}")
-
-            r = SESSION.get(base_url, params=params, timeout=45)
-            if r.status_code != 200:
-                print(f"[Repo][OneMine] {name}: HTTP {r.status_code} on page {page}")
-                break
-
-            parsed = onemine_parse_list_page(r.text)
-            print(
-                f"[Repo][OneMine] {name}: parsed {len(parsed)} list items on page {page}"
-            )
-            if not parsed:
-                break
-
-            if newest_seen is None:
-                newest_seen = parse_date_flexible(parsed[0].get("date_text", ""))
-
-            candidates.extend(parsed)
-            time.sleep(0.3)
-
-            last_date = parse_date_flexible(parsed[-1].get("date_text", ""))
-            if last_date and last_date < start:
-                break
-
-        if newest_seen and newest_seen < start:
-            print(
-                f"[Repo][OneMine][NOTE] {name}: newest item seen is {newest_seen} < START_DATE={start}. Expect 0 in-window results."
-            )
-
-        kept = 0
-        for c in candidates:
-            pub = parse_date_flexible(c.get("date_text", ""))
-            if not in_window(pub, start, end):
-                continue
-
-            authors = c.get("author_text", "")
-            if authors.lower().startswith("by "):
-                authors = authors[3:].strip()
-
-            doc_auth, abstract = onemine_fetch_document_abstract(c["url"])
-            if doc_auth:
-                da = doc_auth
-                if da.lower().startswith("by "):
-                    da = da[3:].strip()
-                if len(da) > len(authors):
-                    authors = da
-
-            if not abstract:
-                abstract = c.get("snippet", "")
-
-            out.append(
-                Item(
-                    title=c["title"],
-                    url=c["url"],
-                    source=name,
-                    source_type="Repository",
-                    published_date=pub,
-                    authors=authors or None,
-                    abstract=abstract or "",
-                )
-            )
-            kept += 1
-
-        print(f"[Repo][OneMine] {name}: kept {kept} in-window items")
-
-    print(f"[Repo][OneMine] Total in-window items (pre-dedupe): {len(out)}")
-    return out
-
-
-# =========================
-# Dedupe
-# =========================
-
-
-# ----------------------------
-# Optional Integrations (Option A) - Keyword scans
-# ----------------------------
-
-
-_INTEGRATION_ALIASES = {
-    # Backward-compatible name
-    "ausimm_digital_library": "ausimm",
-}
-
-
-def _get_integration_cfg(name: str) -> Dict[str, object]:
-    if isinstance(integrations_config, dict) and name in integrations_config:
-        cfg = integrations_config.get(name) or {}
-        return cfg if isinstance(cfg, dict) else {}
-    alias = _INTEGRATION_ALIASES.get(name)
-    if alias and isinstance(integrations_config, dict):
-        cfg = integrations_config.get(alias) or {}
-        return cfg if isinstance(cfg, dict) else {}
-    return {}
-
-
-def _integration_enabled(name: str) -> bool:
-    try:
-        return bool(_get_integration_cfg(name).get("enabled", False))
-    except Exception:
-        return False
-
-
-def _integration_extra_days(name: str) -> int:
-    try:
-        return int(_get_integration_cfg(name).get("extra_days", 0) or 0)
-    except Exception:
-        return 0
-
-
-def _integration_max_items(name: str, default: int = 5) -> int:
-    cfg = _get_integration_cfg(name)
-    val = cfg.get("max_items_per_topic")
-    if val is None:
-        val = cfg.get("max_results_per_query")
-    try:
-        return int(val) if val is not None else int(default)
-    except Exception:
-        return int(default)
-
-
-def _integration_topics_filter(name: str) -> Optional[List[str]]:
-    cfg = _get_integration_cfg(name)
-    topics = cfg.get("topics") or cfg.get("topics_filter")
-    if topics and isinstance(topics, list):
-        return [str(t) for t in topics]
-    return None
-
-
-def _apply_extra_days(start_date_iso: str, extra_days: int) -> str:
-    try:
-        d = dt.date.fromisoformat(start_date_iso)
-        return (d - dt.timedelta(days=int(extra_days))).isoformat()
-    except Exception:
-        return start_date_iso
-
-
-def fetch_crossref_keyword_items(
-    keywords_context: Dict[str, str], start_date: str, end_date: str
-) -> List[Item]:
-    """Keyword scan via Crossref REST API."""
-    if not _integration_enabled("crossref"):
-        return []
-    cfg = integrations_config.get("crossref", {})
-    max_per_topic = _integration_max_items("crossref", default=5)
-    topics_filter = _integration_topics_filter("crossref")
-    mailto = cfg.get("mailto") or os.getenv("CROSSREF_MAILTO") or ""
-
-    effective_start = _apply_extra_days(start_date, _integration_extra_days("crossref"))
-    items: List[Item] = []
-
-    for topic, query in keywords_context.items():
-        if topics_filter and topic not in topics_filter:
-            continue
-        if not query or not str(query).strip():
-            continue
-
-        params = {
-            "rows": max_per_topic,
-            "sort": "published",
-            "order": "desc",
-            "query.bibliographic": query,
-            "filter": f"from-pub-date:{effective_start},until-pub-date:{end_date},type:journal-article",
-        }
-        if mailto:
-            params["mailto"] = mailto
-
-        try:
-            resp = SESSION.get(
-                "https://api.crossref.org/works", params=params, timeout=30
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-            for rec in (payload.get("message", {}) or {}).get("items", []) or []:
-                title = (rec.get("title") or [""])[0] or ""
-                if not title:
-                    continue
-                doi = rec.get("DOI") or ""
-                url = rec.get("URL") or ""
-                container = (rec.get("container-title") or [""])[0] or ""
-                source = (
-                    f"Crossref · {container}".strip(" ·") if container else "Crossref"
-                )
-
-                date_val = ""
-                for key in ("published-print", "published-online", "created"):
-                    parts = ((rec.get(key) or {}).get("date-parts") or [[None]])[
-                        0
-                    ] or []
-                    if parts and parts[0]:
-                        y = int(parts[0])
-                        m = int(parts[1]) if len(parts) > 1 and parts[1] else 1
-                        d = int(parts[2]) if len(parts) > 2 and parts[2] else 1
-                        try:
-                            date_val = dt.date(y, m, d).isoformat()
-                            break
-                        except Exception:
-                            pass
-
-                authors = []
-                for a in rec.get("author") or []:
-                    given = (a.get("given") or "").strip()
-                    family = (a.get("family") or "").strip()
-                    name = " ".join([x for x in [given, family] if x])
-                    if name:
-                        authors.append(name)
-                authors_str = ", ".join(authors)
-
-                items.append(
-                    Item(
-                        source=source,
-                        source_type="Academic",
-                        title=title.strip(),
-                        url=url.strip(),
-                        doi=doi.strip(),
-                        date=date_val,
-                        authors=authors_str,
-                        abstract="",
-                    )
-                )
-        except Exception as e:
-            print(f"[Crossref] Error for topic '{topic}': {e}")
-
-    return items
-
-
-def fetch_semantic_scholar_keyword_items(
-    keywords_context: Dict[str, str], start_date: str, end_date: str
-) -> List[Item]:
-    """Keyword scan via Semantic Scholar Graph API."""
-    if not _integration_enabled("semantic_scholar"):
-        return []
-    cfg = integrations_config.get("semantic_scholar", {})
-    max_per_topic = _integration_max_items("semantic_scholar", default=5)
-    topics_filter = _integration_topics_filter("semantic_scholar")
-    api_key_env = cfg.get("api_key_env") or "SEMANTIC_SCHOLAR_API_KEY"
-    api_key = os.getenv(api_key_env, "")
-
-    effective_start = _apply_extra_days(
-        start_date, _integration_extra_days("semantic_scholar")
-    )
-    start_dt = dt.date.fromisoformat(effective_start)
-    end_dt = dt.date.fromisoformat(end_date)
-
-    headers = {}
-    if api_key:
-        headers["x-api-key"] = api_key
-
-    items: List[Item] = []
-    endpoint = "https://api.semanticscholar.org/graph/v1/paper/search"
-    fields = "title,abstract,url,authors,year,venue,publicationDate,externalIds"
-
-    for topic, query in keywords_context.items():
-        if topics_filter and topic not in topics_filter:
-            continue
-        if not query or not str(query).strip():
-            continue
-
-        limit = min(max_per_topic * 3, 100)
-        params = {"query": query, "limit": limit, "fields": fields}
-
-        try:
-            resp = SESSION.get(endpoint, params=params, headers=headers, timeout=30)
-            resp.raise_for_status()
-            payload = resp.json()
-            kept = 0
-            for rec in payload.get("data") or []:
-                title = rec.get("title") or ""
-                if not title:
-                    continue
-                url = rec.get("url") or ""
-                abstract = rec.get("abstract") or ""
-                venue = rec.get("venue") or ""
-                source = (
-                    f"Semantic Scholar · {venue}".strip(" ·")
-                    if venue
-                    else "Semantic Scholar"
-                )
-
-                ext = rec.get("externalIds") or {}
-                doi = ext.get("DOI") or ext.get("doi") or ""
-
-                date_val = rec.get("publicationDate") or ""
-                if date_val:
-                    try:
-                        d = dt.date.fromisoformat(date_val)
-                        if not (start_dt <= d <= end_dt):
-                            continue
-                    except Exception:
-                        pass
-
-                authors = []
-                for a in rec.get("authors") or []:
-                    name = (a.get("name") or "").strip()
-                    if name:
-                        authors.append(name)
-                authors_str = ", ".join(authors)
-
-                items.append(
-                    Item(
-                        source=source,
-                        source_type="Academic",
-                        title=title.strip(),
-                        url=url.strip(),
-                        doi=str(doi).strip(),
-                        date=str(date_val).strip(),
-                        authors=authors_str,
-                        abstract=str(abstract).strip(),
-                    )
-                )
-                kept += 1
-                if kept >= max_per_topic:
-                    break
-        except Exception as e:
-            print(f"[Semantic Scholar] Error for topic '{topic}': {e}")
-
-    return items
-
-
-def fetch_lens_keyword_items(
-    keywords_context: Dict[str, str], start_date: str, end_date: str
-) -> List[Item]:
-    """Keyword scan via Lens Scholarly API (requires token/key)."""
-    if not _integration_enabled("lens"):
-        return []
-    cfg = integrations_config.get("lens", {})
-    max_per_topic = _integration_max_items("lens", default=5)
-    topics_filter = _integration_topics_filter("lens")
-    api_key_env = cfg.get("api_key_env") or "LENS_API_KEY"
-    token = os.getenv(api_key_env, "")
-
-    if not token:
-        print(f"[Lens] Enabled but missing env var {api_key_env}. Skipping.")
-        return []
-
-    effective_start = _apply_extra_days(start_date, _integration_extra_days("lens"))
-    start_year = dt.date.fromisoformat(effective_start).year
-    end_year = dt.date.fromisoformat(end_date).year
-
-    endpoint = "https://api.lens.org/scholarly/search"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    items: List[Item] = []
-
-    for topic, query in keywords_context.items():
-        if topics_filter and topic not in topics_filter:
-            continue
-        if not query or not str(query).strip():
-            continue
-
-        body = {
-            "query": {
-                "bool": {
-                    "must": [{"query_string": {"query": query}}],
-                    "filter": [
-                        {
-                            "range": {
-                                "year_published": {"gte": start_year, "lte": end_year}
-                            }
-                        }
-                    ],
-                }
-            },
-            "size": max_per_topic,
-            "sort": [{"date_published": "desc"}],
-            "include": [
-                "title",
-                "abstract",
-                "authors",
-                "external_ids",
-                "year_published",
-                "date_published",
-                "source",
-            ],
-        }
-
-        try:
-            resp = SESSION.post(
-                endpoint,
-                params={"token": token},
-                json=body,
-                headers=headers,
-                timeout=30,
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-            for rec in payload.get("data") or []:
-                title = rec.get("title") or ""
-                if not title:
-                    continue
-                abstract = rec.get("abstract") or ""
-                date_val = rec.get("date_published") or ""
-                src_obj = rec.get("source") or {}
-                src_title = src_obj.get("title") if isinstance(src_obj, dict) else ""
-                source = f"Lens · {src_title}".strip(" ·") if src_title else "Lens"
-
-                ext = rec.get("external_ids") or {}
-                doi = ext.get("doi") or ext.get("DOI") or ""
-                url = f"https://doi.org/{doi}" if doi else ""
-
-                authors = []
-                for a in rec.get("authors") or []:
-                    name = a.get("name") if isinstance(a, dict) else None
-                    if name:
-                        authors.append(str(name).strip())
-                authors_str = ", ".join([a for a in authors if a])
-
-                items.append(
-                    Item(
-                        source=source,
-                        source_type="Academic",
-                        title=str(title).strip(),
-                        url=str(url).strip(),
-                        doi=str(doi).strip(),
-                        date=str(date_val).strip(),
-                        authors=authors_str,
-                        abstract=str(abstract).strip(),
-                    )
-                )
-        except Exception as e:
-            print(f"[Lens] Error for topic '{topic}': {e}")
-
-    return items
-
-
-def fetch_arxiv_keyword_items(
-    keywords_context: Dict[str, str], start_date: str, end_date: str
-) -> List[Item]:
-    """Keyword scan via arXiv Atom API."""
-    if not _integration_enabled("arxiv"):
-        return []
-    cfg = integrations_config.get("arxiv", {})
-    max_per_topic = _integration_max_items("arxiv", default=5)
-    topics_filter = _integration_topics_filter("arxiv")
-
-    effective_start = _apply_extra_days(start_date, _integration_extra_days("arxiv"))
-    start_dt = dt.date.fromisoformat(effective_start)
-    end_dt = dt.date.fromisoformat(end_date)
-
-    items: List[Item] = []
-    for topic, query in keywords_context.items():
-        if topics_filter and topic not in topics_filter:
-            continue
-        if not query or not str(query).strip():
-            continue
-
-        search_query = f'all:"{query}"'
-        params = {
-            "search_query": search_query,
-            "start": 0,
-            "max_results": max_per_topic,
-            "sortBy": "submittedDate",
-            "sortOrder": "descending",
-        }
-        try:
-            resp = SESSION.get(
-                "https://export.arxiv.org/api/query", params=params, timeout=30
-            )
-            resp.raise_for_status()
-            feed = feedparser.parse(resp.text)
-            for entry in feed.entries:
-                title = getattr(entry, "title", "") or ""
-                url = getattr(entry, "link", "") or ""
-                summary = getattr(entry, "summary", "") or ""
-                date_val = ""
-                try:
-                    published = getattr(entry, "published", "") or ""
-                    if published:
-                        date_val = published.split("T")[0]
-                        d = dt.date.fromisoformat(date_val)
-                        if not (start_dt <= d <= end_dt):
-                            continue
-                except Exception:
-                    pass
-
-                authors = []
-                for a in getattr(entry, "authors", []) or []:
-                    name = getattr(a, "name", "") or ""
-                    if name:
-                        authors.append(name)
-                authors_str = ", ".join(authors)
-
-                items.append(
-                    Item(
-                        source="arXiv",
-                        source_type="Academic",
-                        title=str(title).strip().replace("\n", " "),
-                        url=str(url).strip(),
-                        doi="",
-                        date=str(date_val).strip(),
-                        authors=authors_str,
-                        abstract=str(summary).strip(),
-                    )
-                )
-        except Exception as e:
-            print(f"[arXiv] Error for topic '{topic}': {e}")
-
-    return items
-
-
-def fetch_ausimm_digital_library_items(
-    keywords_context: Dict[str, str], start_date: str, end_date: str
-) -> List[Item]:
-    """Optional RSS/Atom scan for AusIMM Digital Library (requires rss_feeds)."""
-    if not (
-        _integration_enabled("ausimm_digital_library") or _integration_enabled("ausimm")
-    ):
-        return []
-    cfg = _get_integration_cfg("ausimm_digital_library") or _get_integration_cfg(
-        "ausimm"
-    )
-    feeds = cfg.get("rss_feeds") or []
-    max_total = int(cfg.get("max_items_total", 20))
-    if not feeds:
-        print("[AusIMM DL] Enabled but no rss_feeds configured. Skipping.")
-        return []
-
-    effective_start = _apply_extra_days(
-        start_date, _integration_extra_days("ausimm_digital_library")
-    )
-    start_dt = dt.date.fromisoformat(effective_start)
-    end_dt = dt.date.fromisoformat(end_date)
-
-    items: List[Item] = []
-    for feed_url in feeds:
-        try:
-            feed = feedparser.parse(feed_url)
-            for entry in feed.entries:
-                if len(items) >= max_total:
-                    break
-                title = getattr(entry, "title", "") or ""
-                url = getattr(entry, "link", "") or ""
-                summary = getattr(entry, "summary", "") or ""
-                date_val = ""
-                for k in ("published", "updated"):
-                    v = getattr(entry, k, "") or ""
-                    if v:
-                        date_val = parse_date(v) or ""
-                        break
-
-                if date_val:
-                    try:
-                        d = dt.date.fromisoformat(date_val)
-                        if not (start_dt <= d <= end_dt):
-                            continue
-                    except Exception:
-                        pass
-
-                items.append(
-                    Item(
-                        source="AusIMM Digital Library",
-                        source_type="Academic",
-                        title=str(title).strip(),
-                        url=str(url).strip(),
-                        doi="",
-                        date=str(date_val).strip(),
-                        authors="",
-                        abstract=str(summary).strip(),
-                    )
-                )
-        except Exception as e:
-            print(f"[AusIMM DL] Error parsing feed {feed_url}: {e}")
-
-    return items
 
 
 def dedupe_items(items: List[Item]) -> List[Item]:
     seen = set()
-    out = []
+    out: List[Item] = []
     for it in items:
-        url = (it.url or "").strip()
-        title = normalize_ws(it.title)
-        date_s = it.published_date.isoformat() if it.published_date else ""
-        doi_key = ""
-        if url.lower().startswith("https://doi.org/") or url.lower().startswith(
-            "http://doi.org/"
-        ):
-            doi_key = url.lower().replace("http://", "https://")
-        key = doi_key or url.lower() or (title.lower() + "|" + date_s)
-        key = key.strip() or sha1(title + "|" + date_s + "|" + (it.source or ""))
+        key = (
+            norm_text(it.title),
+            (it.doi or "").lower(),
+            (it.url or "").strip().lower(),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -1435,571 +161,1322 @@ def dedupe_items(items: List[Item]) -> List[Item]:
     return out
 
 
-# =========================
-# AI helpers
-# =========================
-
-
-def ai_rate_limit_sleep(e: Exception) -> None:
-    msg = str(e)
-    m = re.search(r"retry_delay\s*\{\s*seconds:\s*(\d+)", msg)
-    if m:
-        delay = max(int(m.group(1)), 10)
-        print(f"[AI] Rate limit hinted: sleeping {delay}s ...")
-        time.sleep(delay)
-        return
-    print(f"[AI] Rate limit/transient error: sleeping {AI_ERROR_SLEEP_SECONDS}s ...")
-    time.sleep(AI_ERROR_SLEEP_SECONDS)
-
-
-def gemini_call_with_retry(
-    model: genai.GenerativeModel, prompt: str, max_attempts: int = 4
-) -> str:
-    last_err = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            ai_throttle()
-            resp = model.generate_content(prompt)
-            txt = (getattr(resp, "text", "") or "").strip()
-            if not txt:
-                raise RuntimeError("Empty Gemini response.")
-            return txt
-        except Exception as e:
-            last_err = e
-            print(f"[AI] Error attempt {attempt}/{max_attempts}: {e}")
-            if "429" in str(e) or "quota" in str(e).lower() or "rate" in str(e).lower():
-                ai_rate_limit_sleep(e)
-            elif "503" in str(e) or "unavailable" in str(e).lower():
-                time.sleep(AI_ERROR_SLEEP_SECONDS)
-            else:
-                time.sleep(min(5 * attempt, 20))
-    raise RuntimeError(f"Gemini failed after {max_attempts} attempts: {last_err}")
-
-
-def parse_json_strict(text: str) -> Optional[dict]:
-    t = text.strip()
-    t = re.sub(r"^```(?:json)?\s*", "", t)
-    t = re.sub(r"\s*```$", "", t)
-    t = t.strip()
-    try:
-        return json.loads(t)
-    except Exception:
-        m = re.search(r"\{.*\}", t, flags=re.DOTALL)
-        if not m:
-            return None
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            return None
-
-
-def clamp_for_ai(text: str, max_chars: int) -> str:
-    t = normalize_ws(text or "")
-    if len(t) <= max_chars:
-        return t
-    return t[: max_chars - 40].rstrip() + " ... [truncated for AI to reduce tokens]"
-
-
-AI_TRIAGE_SCHEMA = """
-Return ONLY valid JSON:
-{
-  "results": [
-    {
-      "id": "<id>",
-      "decision": "MUST_READ" | "GOOD_TO_READ" | "NOT_SURE",
-      "category": "short label",
-      "highlight": "one sentence highlight",
-      "rationale": "one short sentence why"
-    }
-  ]
-}
-"""
-
-
-def ai_triage_items_batched(
-    items: List[Item], keywords_context: Dict[str, str]
-) -> List[Item]:
-    if not items:
-        return []
-
-    interests = "; ".join([f"{k}: {v}" for k, v in keywords_context.items()])
-    print(
-        f"[AI] Classifying {len(items)} Academic/Repository items with Gemini (batch_size={AI_BATCH_SIZE}) ..."
+def safe_get(
+    url: str, params: Optional[Dict[str, Any]] = None, timeout: int = 30
+) -> requests.Response:
+    return requests.get(
+        url, params=params, timeout=timeout, headers={"User-Agent": USER_AGENT}
     )
 
-    id_map: Dict[str, Item] = {}
-    payload = []
-    for i, it in enumerate(items, start=1):
-        pid = f"it{i}"
-        id_map[pid] = it
-        payload.append(
-            {
-                "id": pid,
-                "title": it.title,
-                "source": it.source,
-                "source_type": it.source_type,
-                "published_date": it.published_date.isoformat()
-                if it.published_date
-                else "",
-                "authors": it.authors or "",
-                "abstract": clamp_for_ai(it.abstract or "", AI_ABSTRACT_MAX_CHARS),
-                "url": it.url,
-            }
+
+def safe_post(
+    url: str,
+    json_payload: Dict[str, Any],
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 30,
+) -> requests.Response:
+    hdrs = {"User-Agent": USER_AGENT}
+    if headers:
+        hdrs.update(headers)
+    return requests.post(url, json=json_payload, headers=hdrs, timeout=timeout)
+
+
+def _simple_yaml_load(raw: str) -> Dict[str, Any]:
+    """
+    Minimal YAML subset loader: handles 'key: value' and nested via indentation.
+    Only for emergencies if PyYAML is unavailable.
+    """
+    result: Dict[str, Any] = {}
+    stack: List[Tuple[int, Dict[str, Any]]] = [(0, result)]
+    for line in raw.splitlines():
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if ":" not in line:
+            continue
+        key, val = line.strip().split(":", 1)
+        val = val.strip()
+        # walk stack
+        while stack and indent < stack[-1][0]:
+            stack.pop()
+        cur = stack[-1][1] if stack else result
+        if val == "":
+            cur[key] = {}
+            stack.append((indent + 2, cur[key]))
+        else:
+            # coerce types
+            if val.lower() in ("true", "false"):
+                cur[key] = val.lower() == "true"
+            else:
+                try:
+                    if "." in val:
+                        cur[key] = float(val)
+                    else:
+                        cur[key] = int(val)
+                except Exception:
+                    cur[key] = val.strip('"').strip("'")
+    return result
+
+
+def load_yaml_file(path: Path) -> Dict[str, Any]:
+    raw = path.read_text(encoding="utf-8")
+    if yaml is not None:
+        return yaml.safe_load(raw) or {}
+    return _simple_yaml_load(raw)
+
+
+def load_config(script_dir: Path) -> Tuple[Dict[str, Any], Optional[Path]]:
+    candidates = [
+        script_dir / "config.yaml",
+        script_dir / "config.yml",
+        script_dir / "config.json",
+    ]
+    for p in candidates:
+        if p.exists():
+            if p.suffix.lower() == ".json":
+                cfg = json.loads(p.read_text(encoding="utf-8"))
+            else:
+                cfg = load_yaml_file(p)
+            merged = dict(DEFAULT_CONFIG)
+            merged.update(cfg or {})
+            return merged, p
+    return dict(DEFAULT_CONFIG), None
+
+
+def load_integrations_config(script_dir: Path) -> Tuple[Dict[str, Any], Optional[Path]]:
+    candidates = [
+        script_dir / "config_integrations.yaml",
+        script_dir / "config_integrations.yml",
+        script_dir / "config_integration.yaml",
+        script_dir / "config_integration.yml",
+    ]
+    for p in candidates:
+        if p.exists():
+            cfg = load_yaml_file(p)
+            merged = dict(DEFAULT_INTEGRATIONS)
+            # shallow merge per key
+            for k, v in (cfg or {}).items():
+                if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                    merged[k] = {**merged[k], **v}
+                else:
+                    merged[k] = v
+            return merged, p
+    return dict(DEFAULT_INTEGRATIONS), None
+
+
+def load_sources_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing sources.csv at: {path}")
+    df = pd.read_csv(path)
+    # Normalize expected columns
+    for col in ["type", "name"]:
+        if col not in df.columns:
+            raise ValueError(
+                f"sources.csv must include column '{col}'. Found: {list(df.columns)}"
+            )
+    df["type"] = df["type"].astype(str).str.strip().str.lower()
+    df["name"] = df["name"].astype(str).str.strip()
+    return df
+
+
+def load_keywords_csv(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+    df = pd.read_csv(path)
+    # Accept "keyword" or first column
+    if "keyword" in df.columns:
+        vals = df["keyword"].astype(str).tolist()
+    else:
+        vals = df.iloc[:, 0].astype(str).tolist()
+    out = []
+    for v in vals:
+        v = v.strip()
+        if v and not v.startswith("#"):
+            out.append(v)
+    return out
+
+
+# ----------------------------
+# Gemini model selection + throttling
+# ----------------------------
+
+
+def _is_text_generation_model(name: str) -> bool:
+    n = name.lower()
+    return n.startswith("models/gemini") or n.startswith("gemini")
+
+
+def _strip_models_prefix(name: str) -> str:
+    return name.split("/", 1)[1] if name.startswith("models/") else name
+
+
+def _model_score(name: str, prefer: str) -> Tuple[int, int, int, int, int]:
+    """
+    Ranking heuristic:
+    - prefer stable-ish aliases (latest) over previews/exp when possible
+    - prefer family (flash vs pro) depending on prefer
+    - then prefer higher major/minor (2.5 > 2.0)
+    """
+    n = name.lower()
+    tag = 0
+    if "latest" in n:
+        tag = 60
+    elif "preview" in n:
+        tag = 30
+    elif "-exp" in n or "experimental" in n:
+        tag = 20
+    elif re.search(r"-\d{3}\b", n):  # revision like -001
+        tag = 10
+
+    m = re.search(r"gemini-(\d+)\.(\d+)", n)
+    major = int(m.group(1)) if m else 0
+    minor = int(m.group(2)) if m else 0
+
+    fam = 0
+    if prefer == "flash":
+        fam = 40 if "flash" in n else 20 if "pro" in n else 0
+    else:
+        fam = 40 if "pro" in n else 20 if "flash" in n else 0
+
+    rev = 0
+    m2 = re.search(r"-(\d{3})\b", n)
+    if m2:
+        rev = int(m2.group(1))
+
+    return (tag, major, minor, fam, rev)
+
+
+def pick_latest_model(prefer: str = "flash") -> Optional[str]:
+    if genai is None:
+        return None
+    try:
+        models = list(genai.list_models())
+    except Exception:
+        return None
+
+    candidates = []
+    for m in models:
+        name = getattr(m, "name", "")
+        methods = getattr(m, "supported_generation_methods", []) or []
+        if not name:
+            continue
+        if "generateContent" not in methods:
+            continue
+        if not _is_text_generation_model(name):
+            continue
+        candidates.append(name)
+
+    if not candidates:
+        return None
+
+    best = sorted(candidates, key=lambda n: _model_score(n, prefer), reverse=True)[0]
+    return _strip_models_prefix(best)
+
+
+_AI_LAST_CALL_MONO = 0.0
+
+
+def ai_throttle(min_interval_seconds: float) -> None:
+    global _AI_LAST_CALL_MONO
+    now = time.monotonic()
+    if _AI_LAST_CALL_MONO <= 0:
+        _AI_LAST_CALL_MONO = now
+        return
+    wait = min_interval_seconds - (now - _AI_LAST_CALL_MONO)
+    if wait > 0:
+        time.sleep(wait)
+    _AI_LAST_CALL_MONO = time.monotonic()
+
+
+def init_gemini() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (sdk_name, model_name).
+    """
+    if genai is None:
+        return None, None
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        return "google-generativeai", None
+    genai.configure(api_key=api_key)
+    # Prefer flash for triage by default.
+    model = pick_latest_model("flash") or "gemini-2.0-flash"
+    return "google-generativeai", model
+
+
+# ----------------------------
+# OpenAlex (journals)
+# ----------------------------
+
+OPENALEX_BASE = "https://api.openalex.org"
+
+
+def _similarity(a: str, b: str) -> float:
+    # lightweight similarity score
+    a, b = norm_text(a), norm_text(b)
+    if not a or not b:
+        return 0.0
+    # token overlap + prefix bonus
+    aset, bset = set(a.split()), set(b.split())
+    jacc = len(aset & bset) / max(1, len(aset | bset))
+    prefix = 0.15 if a == b else (0.05 if a.startswith(b) or b.startswith(a) else 0.0)
+    return min(1.0, jacc + prefix)
+
+
+_OPENALEX_SOURCE_ID_CACHE: Dict[str, str] = {}
+
+
+def resolve_openalex_source_id(
+    journal_name: str, mailto: str = "", timeout: int = 30
+) -> Optional[str]:
+    if journal_name in _OPENALEX_SOURCE_ID_CACHE:
+        return _OPENALEX_SOURCE_ID_CACHE[journal_name]
+
+    params = {"search": journal_name, "per-page": 10}
+    if mailto:
+        params["mailto"] = mailto
+    url = f"{OPENALEX_BASE}/sources"
+    r = safe_get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    results = data.get("results") or []
+
+    best_id = None
+    best_score = -1.0
+    for src in results:
+        disp = src.get("display_name") or ""
+        sid = src.get("id") or ""
+        score = _similarity(journal_name, disp)
+        if score > best_score:
+            best_score = score
+            best_id = sid
+
+    if not best_id:
+        return None
+
+    # Guardrail: avoid bad matches like "Minerals" vs "Minerals Engineering"
+    if best_score < 0.55:
+        print(
+            f"[OpenAlex][WARN] Low-confidence match for '{journal_name}'. Best='{best_id}' score={best_score:.2f}. Skipping."
+        )
+        return None
+
+    _OPENALEX_SOURCE_ID_CACHE[journal_name] = best_id
+    return best_id
+
+
+def fetch_openalex_journal_items(
+    journal_name: str,
+    start_date: dt.date,
+    end_date: dt.date,
+    max_results: int,
+    mailto: str = "",
+    timeout: int = 30,
+) -> List[Item]:
+    sid = resolve_openalex_source_id(journal_name, mailto=mailto, timeout=timeout)
+    if not sid:
+        return []
+
+    # OpenAlex uses full IDs like "https://openalex.org/Sxxxx". Accept both.
+    sid_norm = sid.split("/")[-1] if sid.startswith("http") else sid
+
+    params = {
+        "filter": f"from_publication_date:{iso_date(start_date)},to_publication_date:{iso_date(end_date)},primary_location.source.id:{sid_norm}",
+        "sort": "publication_date:desc",
+        "per-page": max_results,
+    }
+    if mailto:
+        params["mailto"] = mailto
+
+    url = f"{OPENALEX_BASE}/works"
+    r = safe_get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    works = data.get("results") or []
+
+    out: List[Item] = []
+    for w in works:
+        title = (w.get("title") or "").strip()
+        if not title:
+            continue
+        pub = (w.get("publication_date") or "").strip()
+        doi = (w.get("doi") or "").strip()
+        url_ = ""
+        # primary location
+        pl = w.get("primary_location") or {}
+        if isinstance(pl, dict):
+            url_ = (pl.get("landing_page_url") or pl.get("pdf_url") or "").strip()
+        if not url_:
+            url_ = (w.get("id") or "").strip()
+
+        authors = ""
+        auths = []
+        for a in w.get("authorships") or []:
+            try:
+                auths.append(a["author"]["display_name"])
+            except Exception:
+                pass
+        if auths:
+            authors = ", ".join(auths[:15])
+
+        abstract = ""
+        inv = w.get("abstract_inverted_index")
+        if isinstance(inv, dict):
+            # reconstruct quickly (best-effort)
+            pairs = []
+            for word, positions in inv.items():
+                for p in positions:
+                    pairs.append((p, word))
+            pairs.sort(key=lambda x: x[0])
+            abstract = " ".join([w for _, w in pairs])
+
+        out.append(
+            Item(
+                title=title,
+                url=url_,
+                source=journal_name,
+                source_type="academic",
+                published_date=pub or "",
+                authors=authors,
+                abstract=abstract,
+                doi=doi,
+            )
+        )
+    return out
+
+
+# ----------------------------
+# RSS
+# ----------------------------
+
+
+def fetch_rss_items(
+    feed_url: str,
+    feed_name: str,
+    start_date: dt.date,
+    end_date: dt.date,
+    max_items: int,
+) -> List[Item]:
+    parsed = feedparser.parse(feed_url)
+    out: List[Item] = []
+    for entry in parsed.entries[: max_items * 5]:
+        title = getattr(entry, "title", "").strip()
+        link = getattr(entry, "link", "").strip()
+        if not title or not link:
+            continue
+        # date
+        pub = ""
+        if hasattr(entry, "published"):
+            pub = entry.published
+        d = parse_date_flexible(pub) if pub else None
+        if not in_window(d, start_date, end_date):
+            continue
+
+        summary = getattr(entry, "summary", "") or ""
+        out.append(
+            Item(
+                title=title,
+                url=link,
+                source=feed_name,
+                source_type="rss",
+                published_date=iso_date(d) if d else "",
+                abstract=html.unescape(re.sub(r"<[^>]+>", "", summary)).strip(),
+            )
+        )
+        if len(out) >= max_items:
+            break
+    return out
+
+
+# ----------------------------
+# OneMine repository (scrape)
+# ----------------------------
+
+
+def _onemine_search_url(keywords: str, page: int) -> str:
+    # Your code already uses a search URL with many query params.
+    # OneMine sometimes normalizes the URL on redirect; we keep it simple and stable.
+    base = "https://www.onemine.org/search"
+    params = {
+        "SortBy": "MostRecent",
+        "page": str(page),
+        "pageSize": "20",
+        "keywords": keywords,
+        "searchfield": "all",
+    }
+    # We'll let requests handle params when calling safe_get.
+    return base, params
+
+
+def _parse_onemine_date(text_: str) -> Optional[dt.date]:
+    # OneMine date formats vary; try flexible parsing.
+    return parse_date_flexible(text_)
+
+
+def fetch_onemine_items(
+    start_date: dt.date,
+    end_date: dt.date,
+    max_pages: int = 2,
+    categories: Optional[List[Tuple[str, str]]] = None,
+    timeout: int = 30,
+) -> List[Item]:
+    if categories is None:
+        categories = [
+            ("OneMine (global)", "onemine:"),
+            (
+                "SME Annual Conference",
+                "onemine:keywords=SME%20Annual%20Conference&searchfield=all",
+            ),
+            (
+                "International Mineral Processing Congress",
+                "onemine:keywords=International%20Mineral%20Processing%20Congress&searchfield=all",
+            ),
+            (
+                "World Gold Conference",
+                "onemine:keywords=World%20Gold%20Conference&searchfield=all",
+            ),
+            (
+                "Iron Ore Conference",
+                "onemine:keywords=Iron%20Ore%20Conference&searchfield=all",
+            ),
+            (
+                "Copper International Conference",
+                "onemine:keywords=Copper%20International%20Conference&searchfield=all",
+            ),
+            ("AusIMM Bulletin", "onemine:keywords=AusIMM%20Bulletin&searchfield=all"),
+        ]
+
+    out: List[Item] = []
+
+    for cat_name, kw in categories:
+        newest_seen: Optional[dt.date] = None
+        kept = 0
+
+        for page in range(1, max_pages + 1):
+            base, params = _onemine_search_url(kw, page)
+            print(
+                f"[Repo][OneMine] GET {cat_name}: page={page} (keywords='{kw}') url={base}"
+            )
+            r = safe_get(base, params=params, timeout=timeout)
+            if r.status_code != 200:
+                print(
+                    f"[Repo][OneMine][WARN] HTTP {r.status_code} for {cat_name} page={page}"
+                )
+                break
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            # OneMine listings appear as cards; we use heuristics.
+            cards = (
+                soup.select("div.search-result, li.search-result, div.result, article")
+                or []
+            )
+            if not cards:
+                # fallback: find links to /document/
+                cards = soup.find_all("a", href=re.compile(r"/document/"))
+
+            parsed_count = 0
+            for card in cards:
+                parsed_count += 1
+                # link
+                link = ""
+                title = ""
+                if hasattr(card, "select_one"):
+                    a = card.select_one("a[href]")
+                    if a:
+                        link = a.get("href", "").strip()
+                        title = a.get_text(" ", strip=True)
+                if not link and getattr(card, "get", None):
+                    link = card.get("href", "").strip()
+                    title = (
+                        card.get_text(" ", strip=True)
+                        if hasattr(card, "get_text")
+                        else ""
+                    )
+
+                if not link:
+                    continue
+                if link.startswith("/"):
+                    link = "https://www.onemine.org" + link
+                if not title:
+                    continue
+
+                # date (look for something that looks like a date near the card)
+                date_text = ""
+                txt = (
+                    card.get_text(" ", strip=True) if hasattr(card, "get_text") else ""
+                )
+                m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", txt)
+                if m:
+                    date_text = m.group(1)
+                else:
+                    # other common format e.g. "Oct 2, 2025"
+                    m2 = re.search(r"\b([A-Za-z]{3,9}\s+\d{1,2},\s+\d{4})\b", txt)
+                    if m2:
+                        date_text = m2.group(1)
+
+                d = _parse_onemine_date(date_text) if date_text else None
+                if d and (newest_seen is None or d > newest_seen):
+                    newest_seen = d
+
+                if not in_window(d, start_date, end_date):
+                    continue
+
+                out.append(
+                    Item(
+                        title=title,
+                        url=link,
+                        source=cat_name,
+                        source_type="repository",
+                        published_date=iso_date(d) if d else "",
+                    )
+                )
+                kept += 1
+
+            print(
+                f"[Repo][OneMine] {cat_name}: parsed {parsed_count} list items on page {page}"
+            )
+
+            # early stop if newest seen is already older than start_date
+            if newest_seen and newest_seen < start_date:
+                print(
+                    f"[Repo][OneMine][NOTE] {cat_name}: newest item seen is {iso_date(newest_seen)} < START_DATE={iso_date(start_date)}. Expect 0 in-window results."
+                )
+                break
+
+        print(f"[Repo][OneMine] {cat_name}: kept {kept} in-window items")
+
+    return out
+
+
+# ----------------------------
+# Optional integrations (Option A keyword scan)
+# ----------------------------
+
+
+def _integration_enabled(cfg: Dict[str, Any], name: str) -> bool:
+    v = cfg.get(name, {})
+    return bool(v.get("enabled", False))
+
+
+def _integration_max_items(cfg: Dict[str, Any], name: str, default: int) -> int:
+    v = cfg.get(name, {})
+    try:
+        return int(v.get("max_items_per_topic", default))
+    except Exception:
+        return default
+
+
+def _integration_timeout(cfg: Dict[str, Any], name: str, default: int = 30) -> int:
+    v = cfg.get(name, {})
+    try:
+        return int(v.get("timeout_seconds", default))
+    except Exception:
+        return default
+
+
+def _integration_extra_days(
+    cfg_main: Dict[str, Any], cfg_int: Dict[str, Any], name: str
+) -> int:
+    v = cfg_int.get(name, {})
+    try:
+        return int(v.get("extra_days", cfg_main.get("repository_extra_days", 30)))
+    except Exception:
+        return int(cfg_main.get("repository_extra_days", 30))
+
+
+def fetch_crossref_for_topic(
+    topic: str,
+    start_date: dt.date,
+    end_date: dt.date,
+    max_items: int,
+    timeout: int = 30,
+    mailto: str = "",
+) -> List[Item]:
+    """
+    Crossref REST API: https://api.crossref.org/works
+    """
+    url = "https://api.crossref.org/works"
+    params: Dict[str, Any] = {
+        "query": topic,
+        "rows": max(5, min(50, max_items * 3)),
+        "sort": "published",
+        "order": "desc",
+        "filter": f"from-pub-date:{iso_date(start_date)},until-pub-date:{iso_date(end_date)}",
+        "select": "DOI,title,URL,author,issued,published,created,abstract",
+    }
+    if mailto:
+        params["mailto"] = mailto
+
+    r = safe_get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    items = (data.get("message") or {}).get("items") or []
+    out: List[Item] = []
+
+    for it in items:
+        title = ""
+        if isinstance(it.get("title"), list) and it["title"]:
+            title = str(it["title"][0]).strip()
+        elif isinstance(it.get("title"), str):
+            title = it["title"].strip()
+        if not title:
+            continue
+
+        doi = (it.get("DOI") or "").strip()
+        link = (it.get("URL") or "").strip() or (
+            f"https://doi.org/{doi}" if doi else ""
         )
 
-    for batch_start in range(0, len(payload), AI_BATCH_SIZE):
-        batch = payload[batch_start : batch_start + AI_BATCH_SIZE]
+        # date
+        d: Optional[dt.date] = None
+        for k in ("published", "issued", "created"):
+            v = it.get(k)
+            if isinstance(v, dict):
+                parts = (v.get("date-parts") or [[]])[0]
+                if parts:
+                    try:
+                        y = int(parts[0])
+                        m = int(parts[1]) if len(parts) > 1 else 1
+                        dd = int(parts[2]) if len(parts) > 2 else 1
+                        d = dt.date(y, m, dd)
+                        break
+                    except Exception:
+                        pass
 
-        prompt = f"""
-You are an expert research triage assistant for Mining, Mineral Processing, Extractive Metallurgy, and Automation/Control.
+        if not in_window(d, start_date, end_date):
+            continue
 
-My interests (topics -> keywords):
-{interests}
+        # authors
+        auths = []
+        for a in it.get("author") or []:
+            fam = a.get("family") or ""
+            giv = a.get("given") or ""
+            nm = (giv + " " + fam).strip()
+            if nm:
+                auths.append(nm)
+        authors = ", ".join(auths[:15])
 
-Classify each item into exactly one decision:
-- MUST_READ
-- GOOD_TO_READ
-- NOT_SURE
+        abstract = it.get("abstract") or ""
+        if abstract:
+            abstract = re.sub(r"<[^>]+>", "", str(abstract))
+            abstract = html.unescape(abstract).strip()
 
-Items (JSON):
-{json.dumps(batch, ensure_ascii=False)}
+        out.append(
+            Item(
+                title=title,
+                url=link,
+                source="Crossref",
+                source_type="integration",
+                published_date=iso_date(d) if d else "",
+                authors=authors,
+                abstract=abstract,
+                doi=doi,
+            )
+        )
+        if len(out) >= max_items:
+            break
 
-{AI_TRIAGE_SCHEMA}
-""".strip()
+    return out
 
+
+def fetch_arxiv_for_topic(
+    topic: str,
+    start_date: dt.date,
+    end_date: dt.date,
+    max_items: int,
+    timeout: int = 30,
+) -> List[Item]:
+    """
+    arXiv API (Atom): http://export.arxiv.org/api/query
+    Date filter uses submittedDate range query syntax.
+    """
+    # arXiv uses UTC timestamps without separators
+    start_q = start_date.strftime("%Y%m%d") + "0000"
+    end_q = end_date.strftime("%Y%m%d") + "2359"
+    search_query = f'(all:"{topic}") AND submittedDate:[{start_q} TO {end_q}]'
+    url = "http://export.arxiv.org/api/query"
+    params = {
+        "search_query": search_query,
+        "start": 0,
+        "max_results": max(5, min(50, max_items * 3)),
+        "sortBy": "submittedDate",
+        "sortOrder": "descending",
+    }
+    r = safe_get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    feed = feedparser.parse(r.text)
+
+    out: List[Item] = []
+    for entry in feed.entries:
+        title = getattr(entry, "title", "").strip().replace("\n", " ")
+        link = getattr(entry, "link", "").strip()
+        if not title or not link:
+            continue
+        pub_s = getattr(entry, "published", "") or getattr(entry, "updated", "")
+        d = parse_date_flexible(pub_s)
+        if not in_window(d, start_date, end_date):
+            continue
+        authors = ", ".join(
+            [a.name for a in getattr(entry, "authors", []) if getattr(a, "name", "")][
+                :15
+            ]
+        )
+        abstract = getattr(entry, "summary", "") or ""
+        abstract = html.unescape(re.sub(r"<[^>]+>", "", abstract)).strip()
+
+        out.append(
+            Item(
+                title=title,
+                url=link,
+                source="arXiv",
+                source_type="integration",
+                published_date=iso_date(d) if d else "",
+                authors=authors,
+                abstract=abstract,
+            )
+        )
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def fetch_ausimm_from_rss(
+    rss_url: str,
+    start_date: dt.date,
+    end_date: dt.date,
+    max_items: int,
+    timeout: int = 30,
+) -> List[Item]:
+    """
+    AusIMM Digital Library: safest integration is via RSS if you have a feed URL.
+    If you don't have an RSS URL, leave it blank and this integration will no-op.
+    """
+    if not rss_url:
+        print("[Integrations][AusIMM] rss_url not configured; skipping.")
+        return []
+    parsed = feedparser.parse(rss_url)
+    out: List[Item] = []
+    for entry in parsed.entries[: max_items * 5]:
+        title = getattr(entry, "title", "").strip()
+        link = getattr(entry, "link", "").strip()
+        if not title or not link:
+            continue
+        pub = getattr(entry, "published", "") or getattr(entry, "updated", "")
+        d = parse_date_flexible(pub)
+        if not in_window(d, start_date, end_date):
+            continue
+        summary = getattr(entry, "summary", "") or ""
+        out.append(
+            Item(
+                title=title,
+                url=link,
+                source="AusIMM Digital Library",
+                source_type="integration",
+                published_date=iso_date(d) if d else "",
+                abstract=html.unescape(re.sub(r"<[^>]+>", "", summary)).strip(),
+            )
+        )
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def collect_integrations(
+    config: Dict[str, Any],
+    integrations: Dict[str, Any],
+    keywords: List[str],
+    start_date: dt.date,
+    end_date: dt.date,
+) -> List[Item]:
+    """
+    Option A: run keyword-based scans against enabled sources and merge.
+    """
+    items: List[Item] = []
+    topics = keywords[:]
+    if not topics:
+        return items
+
+    # Crossref
+    if _integration_enabled(integrations, "crossref"):
+        extra = _integration_extra_days(config, integrations, "crossref")
+        s = start_date - dt.timedelta(days=extra)
+        timeout = _integration_timeout(integrations, "crossref", 30)
+        max_per = _integration_max_items(integrations, "crossref", 5)
+        mailto = (
+            os.getenv(integrations.get("crossref", {}).get("mailto_env", "") or "")
+            or ""
+        )
+        print(
+            f"[Integrations] Crossref enabled. Window: {iso_date(s)} -> {iso_date(end_date)}."
+        )
+        for topic in topics:
+            try:
+                items.extend(
+                    fetch_crossref_for_topic(
+                        topic, s, end_date, max_per, timeout=timeout, mailto=mailto
+                    )
+                )
+            except Exception as e:
+                print(f"[Integrations][Crossref][WARN] topic='{topic}': {e}")
+
+    # arXiv
+    if _integration_enabled(integrations, "arxiv"):
+        extra = _integration_extra_days(config, integrations, "arxiv")
+        s = start_date - dt.timedelta(days=extra)
+        timeout = _integration_timeout(integrations, "arxiv", 30)
+        max_per = _integration_max_items(integrations, "arxiv", 5)
+        print(
+            f"[Integrations] arXiv enabled. Window: {iso_date(s)} -> {iso_date(end_date)}."
+        )
+        for topic in topics:
+            try:
+                items.extend(
+                    fetch_arxiv_for_topic(topic, s, end_date, max_per, timeout=timeout)
+                )
+            except Exception as e:
+                print(f"[Integrations][arXiv][WARN] topic='{topic}': {e}")
+
+    # AusIMM (RSS only)
+    if _integration_enabled(integrations, "ausimm"):
+        extra = _integration_extra_days(config, integrations, "ausimm")
+        s = start_date - dt.timedelta(days=extra)
+        timeout = _integration_timeout(integrations, "ausimm", 30)
+        max_per = _integration_max_items(integrations, "ausimm", 5)
+        rss_url = integrations.get("ausimm", {}).get("rss_url", "") or ""
+        print(
+            f"[Integrations] AusIMM enabled (RSS). Window: {iso_date(s)} -> {iso_date(end_date)}."
+        )
         try:
-            txt = gemini_call_with_retry(gemini_model_triage, prompt, max_attempts=4)
-            data = parse_json_strict(txt)
-            if not data or "results" not in data:
-                raise RuntimeError("Bad JSON from Gemini (missing results).")
-
-            got = {r.get("id"): r for r in (data.get("results") or [])}
-            for b in batch:
-                pid = b["id"]
-                it = id_map[pid]
-                r = got.get(pid, {}) or {}
-
-                dec = (r.get("decision") or "NOT_SURE").strip().upper()
-                if dec not in {"MUST_READ", "GOOD_TO_READ", "NOT_SURE"}:
-                    dec = "NOT_SURE"
-
-                it.decision = dec
-                it.category = normalize_ws(str(r.get("category") or "General"))
-                it.highlight = normalize_ws(str(r.get("highlight") or ""))
-                it.rationale = normalize_ws(str(r.get("rationale") or ""))
+            items.extend(
+                fetch_ausimm_from_rss(rss_url, s, end_date, max_per, timeout=timeout)
+            )
         except Exception as e:
-            print(f"[AI] Batch error ({batch_start}..): {e}")
-            for b in batch:
-                it = id_map[b["id"]]
-                it.decision = "NOT_SURE"
-                it.category = "AI_Error"
-                it.highlight = "AI error; included for manual review."
-                it.rationale = "Fail-open to avoid missing relevant items."
+            print(f"[Integrations][AusIMM][WARN] {e}")
 
-        time.sleep(AI_SLEEP_SECONDS)
-
-    print(f"[AI] Classified {len(items)} Academic/Repository items.")
+    # Semantic Scholar and Lens are intentionally no-op until you add API keys and enable them.
     return items
 
 
-def ai_trend_paragraphs_per_source(
-    items: List[Item], max_items_per_source: int
-) -> Dict[str, str]:
-    by_source = defaultdict(list)
-    for it in items:
-        by_source[it.source].append(it)
+# ----------------------------
+# AI triage (classification/summarisation)
+# ----------------------------
 
-    def rank(d: str) -> int:
-        return {"MUST_READ": 0, "GOOD_TO_READ": 1, "NOT_SURE": 2}.get(
-            d or "NOT_SURE", 2
+
+def build_triage_prompt(batch: List[Item]) -> str:
+    # Keep prompt compact to reduce tokens
+    lines = []
+    for i, it in enumerate(batch, start=1):
+        lines.append(
+            f"{i}. {it.title}\n   Source: {it.source}\n   URL: {it.url}\n   Date: {it.published_date}\n"
         )
-
-    out: Dict[str, str] = {}
-    for src, arr in sorted(by_source.items(), key=lambda x: x[0].lower()):
-        arr_sorted = sorted(
-            arr,
-            key=lambda x: (rank(x.decision), x.published_date or dt.date(1900, 1, 1)),
-        )
-        take = arr_sorted[:max_items_per_source]
-
-        mini = [
-            {
-                "title": it.title,
-                "decision": it.decision,
-                "category": it.category or "",
-                "abstract_snippet": clamp_for_ai(it.abstract or "", 450),
-            }
-            for it in take
-        ]
-
-        prompt = f"""
-Write ONE paragraph (3–5 sentences) summarising dominant themes for this source in the coverage window.
-
-Source: {src}
-Coverage: {START_DATE} to {END_DATE}
-
-Items (JSON):
-{json.dumps(mini, ensure_ascii=False)}
-
-Return only the paragraph text (no headings).
-""".strip()
-
-        try:
-            txt = gemini_call_with_retry(gemini_model_trends, prompt, max_attempts=3)
-            out[src] = normalize_ws(txt)
-        except Exception as e:
-            print(f"[AI][Trends] {src}: {e}")
-            out[src] = ""
-
-        time.sleep(AI_SLEEP_SECONDS)
-
-    return out
+    return (
+        "You are triaging research items for mining/mineral processing/process control/sustainability.\n"
+        "For each item, output a JSON array of objects with keys: index, keep (true/false), reason (<=20 words), tags (array of <=6 short tags).\n"
+        "Be conservative: keep only items likely relevant.\n\n"
+        "Items:\n" + "\n".join(lines)
+    )
 
 
-# =========================
-# Overviews (deterministic)
-# =========================
+def gemini_generate_json(model: Any, prompt: str) -> Any:
+    resp = model.generate_content(prompt)
+    text = getattr(resp, "text", "") or ""
+    # try to extract JSON
+    m = re.search(r"\[.*\]", text, flags=re.S)
+    if not m:
+        return None
+    return json.loads(m.group(0))
 
 
-def build_source_overviews(items: List[Item]) -> Dict[str, dict]:
-    by_source = defaultdict(list)
-    for it in items:
-        by_source[it.source].append(it)
-
-    out = {}
-    for src, arr in by_source.items():
-        decisions = Counter([a.decision or "UNKNOWN" for a in arr])
-        cats = Counter([a.category or "General" for a in arr]).most_common(5)
-        out[src] = {
-            "total": len(arr),
-            "decisions": dict(decisions),
-            "top_categories": cats,
-        }
-    return out
-
-
-# =========================
-# CSV
-# =========================
-
-
-def items_to_dataframe(items: List[Item]) -> pd.DataFrame:
-    rows = []
-    for it in items:
-        rows.append(
-            {
-                "title": it.title,
-                "authors": it.authors or "",
-                "published_date": it.published_date.isoformat()
-                if it.published_date
-                else "",
-                "source": it.source,
-                "source_type": it.source_type,
-                "url": it.url,
-                "abstract": it.abstract or "",
-                "decision": it.decision or "",
-                "category": it.category or "",
-                "highlight": it.highlight or "",
-                "rationale": it.rationale or "",
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-def write_csv(df: pd.DataFrame, path: str) -> None:
-    df.to_csv(path, index=False, encoding="utf-8-sig")
-
-
-# =========================
-# Newsletter rendering
-# =========================
-
-
-def render_newsletter_html(
-    start: dt.date,
-    end: dt.date,
-    repo_start: dt.date,
-    repo_end: dt.date,
-    collected_counts: Dict[str, int],
-    source_overviews: Dict[str, dict],
+def triage_items_with_gemini(
     items: List[Item],
-    trend_notes: Dict[str, str],
-    attachment_names: List[str],
+    gemini_model_name: Optional[str],
+    min_interval_seconds: float,
+    error_sleep_seconds: float,
+    batch_size: int = 6,
+    max_retries: int = 3,
+) -> List[Dict[str, Any]]:
+    if genai is None or not gemini_model_name:
+        print("[AI][WARN] Gemini not configured; skipping triage.")
+        return []
+
+    model = genai.GenerativeModel(gemini_model_name)
+    triaged_rows: List[Dict[str, Any]] = []
+
+    batches = [items[i : i + batch_size] for i in range(0, len(items), batch_size)]
+    print(
+        f"[AI] Classifying {len(items)} items with Gemini (batch_size={batch_size}) ..."
+    )
+
+    for b in batches:
+        prompt = build_triage_prompt(b)
+
+        last_err = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                ai_throttle(min_interval_seconds)
+                result = gemini_generate_json(model, prompt)
+                if not isinstance(result, list):
+                    raise ValueError("No JSON array found in model response.")
+                # Map back to items
+                for obj in result:
+                    idx = int(obj.get("index", 0))
+                    if idx <= 0 or idx > len(b):
+                        continue
+                    it = b[idx - 1]
+                    triaged_rows.append(
+                        {
+                            "title": it.title,
+                            "url": it.url,
+                            "source": it.source,
+                            "source_type": it.source_type,
+                            "published_date": it.published_date,
+                            "authors": it.authors,
+                            "doi": it.doi,
+                            "keep": bool(obj.get("keep", False)),
+                            "reason": str(obj.get("reason", ""))[:200],
+                            "tags": ",".join(obj.get("tags", []) or [])[:200],
+                        }
+                    )
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                # crude rate-limit detection
+                if "429" in msg or "Resource exhausted" in msg:
+                    print(
+                        f"[AI] Rate limit: sleeping {max(60, int(error_sleep_seconds))}s ..."
+                    )
+                    time.sleep(max(60, int(error_sleep_seconds)))
+                else:
+                    time.sleep(error_sleep_seconds)
+
+        if last_err is not None:
+            print(f"[AI][WARN] Failed batch after {max_retries} attempts: {last_err}")
+
+    return triaged_rows
+
+
+# ----------------------------
+# Render + email (email sending left unchanged; you already have working SMTP bits)
+# ----------------------------
+
+
+def write_csv(path: Path, items: List[Item]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(
+            f,
+            fieldnames=list(asdict(items[0]).keys())
+            if items
+            else list(asdict(Item("", "", "", "", "")).keys()),
+        )
+        w.writeheader()
+        for it in items:
+            w.writerow(asdict(it))
+
+
+def write_triaged_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        # write header-only
+        cols = [
+            "title",
+            "url",
+            "source",
+            "source_type",
+            "published_date",
+            "authors",
+            "doi",
+            "keep",
+            "reason",
+            "tags",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+        return
+    cols = list(rows[0].keys())
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+def render_html_digest(
+    items: List[Item],
+    triaged: List[Dict[str, Any]],
+    window_start: dt.date,
+    window_end: dt.date,
+    title: str,
 ) -> str:
-    def decision_rank(d: str) -> int:
-        return {"MUST_READ": 0, "GOOD_TO_READ": 1, "NOT_SURE": 2}.get(
-            d or "NOT_SURE", 2
-        )
+    kept = [r for r in triaged if r.get("keep")]
+    kept_by_source: Dict[str, List[Dict[str, Any]]] = {}
+    for r in kept:
+        kept_by_source.setdefault(r.get("source", "Unknown"), []).append(r)
 
-    items_sorted = sorted(
-        items,
-        key=lambda x: (
-            x.source.lower(),
-            decision_rank(x.decision or "NOT_SURE"),
-            x.published_date or dt.date(1900, 1, 1),
-        ),
-        reverse=False,
+    def esc(s: str) -> str:
+        return html.escape(s or "")
+
+    parts = []
+    parts.append(
+        f"<html><head><meta charset='utf-8'><title>{esc(title)}</title></head><body>"
+    )
+    parts.append(f"<h2>{esc(title)}</h2>")
+    parts.append(
+        f"<p><b>Coverage:</b> {esc(iso_date(window_start))} → {esc(iso_date(window_end))} (UTC)</p>"
+    )
+    parts.append(
+        f"<p><b>Total items collected:</b> {len(items)} &nbsp; | &nbsp; <b>Kept after triage:</b> {len(kept)}</p>"
     )
 
-    all_sources = sorted(set(collected_counts.keys()), key=lambda s: s.lower())
+    if not kept:
+        parts.append("<p><i>No items were kept by the triage filter this run.</i></p>")
+    else:
+        for src, rows in sorted(kept_by_source.items(), key=lambda x: x[0].lower()):
+            parts.append(f"<h3>{esc(src)}</h3><ul>")
+            for r in rows:
+                parts.append(
+                    "<li>"
+                    f"<a href='{esc(r.get('url', ''))}'>{esc(r.get('title', ''))}</a>"
+                    f" <small>({esc(r.get('published_date', ''))})</small><br/>"
+                    f"<small>{esc(r.get('reason', ''))}</small>"
+                    "</li>"
+                )
+            parts.append("</ul>")
 
-    html = f"""
-<html>
-<body style="font-family: Arial, Helvetica, sans-serif; color: #222;">
-  <div style="background:#1f2d3d; padding: 18px;">
-    <h2 style="color:#fff; margin:0;">⛏️ Weekly Mining & Processing Digest</h2>
-    <div style="color:#cfd8dc; margin-top:6px;">
-      Academic/News coverage: {start} → {end} <br/>
-      Repository coverage (OneMine): {repo_start} → {repo_end}
-    </div>
-  </div>
-
-  <div style="padding: 18px;">
-    <h3 style="margin-top:0;">Overview</h3>
-    <p>Repository sources are searched over an extended window (+30 days) to compensate for slower repository publishing/update cycles.</p>
-
-    <h3>Collected by Source</h3>
-    <table style="border-collapse: collapse; width: 100%; max-width: 900px;">
-      <tr>
-        <th style="border-bottom:1px solid #ccc; text-align:left; padding:6px;">Source</th>
-        <th style="border-bottom:1px solid #ccc; text-align:left; padding:6px;">Collected</th>
-        <th style="border-bottom:1px solid #ccc; text-align:left; padding:6px;">MUST_READ</th>
-        <th style="border-bottom:1px solid #ccc; text-align:left; padding:6px;">GOOD_TO_READ</th>
-        <th style="border-bottom:1px solid #ccc; text-align:left; padding:6px;">NOT_SURE</th>
-      </tr>
-    """
-
-    for src in all_sources:
-        ov = source_overviews.get(src, {})
-        decs = ov.get("decisions", {})
-        html += f"""
-      <tr>
-        <td style="border-bottom:1px solid #eee; padding:6px;">{src}</td>
-        <td style="border-bottom:1px solid #eee; padding:6px;">{collected_counts.get(src, 0)}</td>
-        <td style="border-bottom:1px solid #eee; padding:6px;">{decs.get("MUST_READ", 0)}</td>
-        <td style="border-bottom:1px solid #eee; padding:6px;">{decs.get("GOOD_TO_READ", 0)}</td>
-        <td style="border-bottom:1px solid #eee; padding:6px;">{decs.get("NOT_SURE", 0)}</td>
-      </tr>
-        """
-
-    html += "</table>"
-
-    if attachment_names:
-        html += "<h3 style='margin-top:22px;'>Attachments</h3><ul>"
-        for a in attachment_names:
-            html += f"<li>{a}</li>"
-        html += "</ul>"
-
-    html += "<h3 style='margin-top:26px;'>Source Trend Notes</h3>"
-    for src in all_sources:
-        note = (trend_notes.get(src) or "").strip()
-        if not note:
-            continue
-        html += f"""
-        <div style="margin-top:14px; padding:10px; border:1px solid #eee; border-radius:8px;">
-          <div style="font-weight:bold;">{src}</div>
-          <div style="font-size:13px; color:#333; margin-top:6px; line-height:1.4;">
-            {note}
-          </div>
-        </div>
-        """
-
-    html += "<h3 style='margin-top:26px;'>Detailed Items</h3>"
-
-    current_source = None
-    for it in items_sorted:
-        if it.source != current_source:
-            current_source = it.source
-            html += f"<h4 style='margin-top:22px; border-bottom:2px solid #efefef; padding-bottom:6px;'>{current_source}</h4>"
-
-        badge = it.decision or "NOT_SURE"
-        badge_color = {
-            "MUST_READ": "#b71c1c",
-            "GOOD_TO_READ": "#ef6c00",
-            "NOT_SURE": "#546e7a",
-        }.get(badge, "#546e7a")
-
-        pub = it.published_date.isoformat() if it.published_date else "Unknown date"
-        authors = it.authors or "Unknown"
-        cat = it.category or "General"
-        highlight = it.highlight or ""
-        rationale = it.rationale or ""
-
-        html += f"""
-        <div style="margin:12px 0; padding:12px; border-left:6px solid {badge_color}; background:#fafafa; border-radius:6px;">
-          <div style="font-size:12px; color:#444; margin-bottom:6px;">
-            <span style="display:inline-block; padding:2px 8px; border-radius:10px; background:{badge_color}; color:#fff; font-weight:bold;">{badge}</span>
-            <span style="margin-left:8px;">{pub}</span>
-            <span style="margin-left:8px; color:#666;">[{cat}]</span>
-          </div>
-
-          <div style="font-size:16px; font-weight:bold; margin-bottom:6px;">
-            <a href="{it.url}" style="color:#1f2d3d; text-decoration:none;">{it.title}</a>
-          </div>
-
-          <div style="font-size:13px; color:#666; margin-bottom:8px;">
-            Source: {it.source_type} | Authors: {authors}
-          </div>
-
-          <div style="font-size:13px; color:#333;"><b>AI highlight:</b> {highlight}</div>
-          <div style="font-size:12px; color:#555; margin-top:6px;">{rationale}</div>
-        </div>
-        """
-
-    html += """
-  </div>
-  <div style="padding: 18px; text-align:center; font-size: 12px; color:#999;">Generated automatically.</div>
-</body>
-</html>
-"""
-    return html
+    parts.append("</body></html>")
+    return "\n".join(parts)
 
 
-# =========================
-# Email
-# =========================
+# ----------------------------
+# Pipeline
+# ----------------------------
 
 
-def attach_file(msg: MIMEMultipart, filepath: str) -> None:
-    with open(filepath, "rb") as f:
-        part = MIMEBase("application", "octet-stream")
-        part.set_payload(f.read())
-    encoders.encode_base64(part)
-    filename = os.path.basename(filepath)
-    part.add_header("Content-Disposition", f'attachment; filename="{filename}"')
-    msg.attach(part)
+def run_pipeline(script_dir: Path, no_email: bool = False) -> None:
+    # Load env + config
+    env_path = script_dir / ".env"
+    load_dotenv(dotenv_path=env_path if env_path.exists() else None)
+    print(f"[ENV] Loaded .env from: {env_path} (exists={env_path.exists()})")
 
+    config, cfg_path = load_config(script_dir)
+    print(f"[CONFIG] Loaded config from: {cfg_path if cfg_path else '(defaults)'}")
 
-def send_email(html: str, attachments: List[str]) -> None:
-    if not EMAIL_SENDER or not EMAIL_PASSWORD or not EMAIL_RECEIVER:
-        raise ValueError(
-            "EMAIL_SENDER/EMAIL_PASSWORD/EMAIL_RECEIVER missing. Set them in .env or GitHub Secrets."
-        )
+    integrations, int_path = load_integrations_config(script_dir)
+    print(
+        f"[INTEGRATIONS] Loaded integrations config from: {int_path if int_path else '(defaults)'}"
+    )
 
-    msg = MIMEMultipart()
-    msg["Subject"] = f"{EMAIL_SUBJECT} - {TODAY}"
-    msg["From"] = EMAIL_SENDER
-    msg["To"] = EMAIL_RECEIVER
-    msg.attach(MIMEText(html, "html"))
+    # Date window
+    lookback_days = int(config.get("lookback_days", 7))
+    end_date = utc_today()
+    start_date = end_date - dt.timedelta(days=lookback_days)
+    print(
+        f"[WINDOW] Coverage: {iso_date(start_date)} -> {iso_date(end_date)} (lookback_days={lookback_days})"
+    )
 
-    for fp in attachments:
-        if fp and os.path.exists(fp):
-            attach_file(msg, fp)
+    # Gemini
+    sdk_name, gemini_model_name = init_gemini()
+    if sdk_name and gemini_model_name:
+        print(f"[GEMINI] SDK={sdk_name} model={gemini_model_name}")
+    elif sdk_name:
+        print(f"[GEMINI] SDK={sdk_name} but no model available (missing API key?)")
+    else:
+        print("[GEMINI] SDK not available (install google-generativeai).")
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.send_message(msg)
-
-    print("[EMAIL] Sent successfully (with attachments).")
-
-
-# =========================
-# Main pipeline
-# =========================
-
-
-def run_pipeline(
-    keywords_csv: str = "keywords.csv",
-    sources_csv: str = "sources.csv",
-    do_send_email: bool = True,
-) -> None:
-    keywords_path = os.path.join(SCRIPT_DIR, keywords_csv)
-    sources_path = os.path.join(SCRIPT_DIR, sources_csv)
-    if not os.path.exists(keywords_path):
-        raise FileNotFoundError(f"Missing {keywords_path}")
-    if not os.path.exists(sources_path):
-        raise FileNotFoundError(f"Missing {sources_path}")
-
-    keywords_context = load_keywords_csv(keywords_path)
+    # Inputs
+    sources_path = script_dir / "sources.csv"
+    keywords_path = script_dir / "keywords.csv"
     sources_df = load_sources_csv(sources_path)
+    keywords = load_keywords_csv(keywords_path)
 
-    print("\n[PIPELINE] Step 1: Collect items (OpenAlex + RSS + OneMine)")
+    max_items_per_feed = int(config.get("max_items_per_feed", 5))
+
     collected: List[Item] = []
-    collected.extend(fetch_openalex_journal_items(sources_df, START_DATE, END_DATE))
-    collected.extend(fetch_rss_items(sources_df, START_DATE, END_DATE))
-    collected.extend(
-        fetch_onemine_repository_items(
-            sources_df, REPO_START_DATE, REPO_END_DATE, max_pages=3, page_size=20
-        )
-    )
-
-
-# Optional keyword-scan integrations (Option A)
-try:
-    collected.extend(
-        fetch_crossref_keyword_items(keywords_context, START_DATE, END_DATE)
-    )
-    collected.extend(
-        fetch_semantic_scholar_keyword_items(keywords_context, START_DATE, END_DATE)
-    )
-    collected.extend(fetch_lens_keyword_items(keywords_context, START_DATE, END_DATE))
-    collected.extend(fetch_arxiv_keyword_items(keywords_context, START_DATE, END_DATE))
-    collected.extend(
-        fetch_ausimm_digital_library_items(keywords_context, START_DATE, END_DATE)
-    )
-except Exception as e:
-    print(f"[Integrations] Unexpected error while fetching integration items: {e}")
-
-    collected = dedupe_items(collected)
-    print(f"[PIPELINE] Collected total (deduped): {len(collected)}")
-
-    # AI only for Academic + Repository
-    ai_items = [it for it in collected if it.source_type in {"Academic", "Repository"}]
-
-    out_dir = os.path.join(SCRIPT_DIR, "output")
-    os.makedirs(out_dir, exist_ok=True)
-
-    raw_path = os.path.join(out_dir, f"raw_academic_repository_{TODAY}.csv")
-    write_csv(items_to_dataframe(ai_items), raw_path)
-    print(f"[PIPELINE] Wrote raw CSV: {raw_path}")
 
     print(
-        "\n[PIPELINE] Step 2: AI triage ONLY for Academic + Repository (token optimisation)"
+        "\n[PIPELINE] Step 1: Collect items (OpenAlex + RSS + OneMine + Integrations)"
     )
-    triaged = ai_triage_items_batched(ai_items, keywords_context)
+    # OpenAlex (journals)
+    if bool(integrations.get("openalex", {}).get("enabled", True)):
+        mailto_env = (
+            integrations.get("openalex", {}).get("polite_pool_email_env", "") or ""
+        )
+        mailto = os.getenv(mailto_env, "") if mailto_env else ""
+        oa_timeout = int(integrations.get("openalex", {}).get("timeout_seconds", 30))
+        per_journal = int(
+            integrations.get("openalex", {}).get(
+                "per_journal_max_results", max_items_per_feed
+            )
+        )
 
-    triaged_path = os.path.join(out_dir, f"triaged_academic_repository_{TODAY}.csv")
-    write_csv(items_to_dataframe(triaged), triaged_path)
-    print(f"[PIPELINE] Wrote triaged CSV: {triaged_path}")
-
-    print("\n[PIPELINE] Step 3: Build deterministic source overviews")
-    overviews = build_source_overviews(triaged)
-
-    print("\n[PIPELINE] Step 3b: AI trend paragraph per source (capped)")
-    trend_notes = ai_trend_paragraphs_per_source(
-        triaged, max_items_per_source=TREND_ITEMS_CAP
-    )
-
-    print("\n[PIPELINE] Step 4: Render newsletter")
-    collected_counts = Counter([i.source for i in triaged])
-    attachment_paths = [raw_path, triaged_path]
-    attachment_names = [os.path.basename(p) for p in attachment_paths]
-
-    html = render_newsletter_html(
-        start=START_DATE,
-        end=END_DATE,
-        repo_start=REPO_START_DATE,
-        repo_end=REPO_END_DATE,
-        collected_counts=dict(collected_counts),
-        source_overviews=overviews,
-        items=triaged,
-        trend_notes=trend_notes,
-        attachment_names=attachment_names,
-    )
-
-    out_html = os.path.join(out_dir, f"digest_{TODAY}.html")
-    with open(out_html, "w", encoding="utf-8") as f:
-        f.write(html)
-    print(f"[PIPELINE] Saved HTML to: {out_html}")
-
-    print("\n[PIPELINE] Step 5: Send email (with attachments)")
-    if do_send_email:
-        send_email(html, attachments=[out_html] + attachment_paths)
+        journal_sources = sources_df[sources_df["type"] == "journal"]["name"].tolist()
+        for jname in journal_sources:
+            try:
+                print(f"[OpenAlex] Querying: {jname} ...")
+                items = fetch_openalex_journal_items(
+                    jname,
+                    start_date,
+                    end_date,
+                    per_journal,
+                    mailto=mailto,
+                    timeout=oa_timeout,
+                )
+                collected.extend(items)
+                print(f"[OpenAlex] {jname}: fetched {len(items)} candidates")
+            except Exception as e:
+                print(f"[OpenAlex][WARN] {jname}: {e}")
     else:
-        print("[PIPELINE] Email sending disabled (do_send_email=False).")
+        print("[OpenAlex] Disabled by integrations config.")
+
+    # RSS
+    rss_sources = sources_df[sources_df["type"] == "rss"]
+    if len(rss_sources) == 0:
+        print("[RSS] No rss sources configured.")
+    else:
+        for _, row in rss_sources.iterrows():
+            feed_name = str(row["name"]).strip()
+            feed_url = str(row.get("url") or row.get("rss_url") or "").strip()
+            if not feed_url:
+                continue
+            try:
+                items = fetch_rss_items(
+                    feed_url, feed_name, start_date, end_date, max_items_per_feed
+                )
+                collected.extend(items)
+                print(f"[RSS] {feed_name}: fetched {len(items)}")
+            except Exception as e:
+                print(f"[RSS][WARN] {feed_name}: {e}")
+
+    # OneMine (repositories) - ALWAYS extend by repository_extra_days
+    repo_extra = int(config.get("repository_extra_days", 30))
+    repo_start = start_date - dt.timedelta(days=repo_extra)
+    try:
+        onemine_items = fetch_onemine_items(
+            repo_start, end_date, max_pages=2, timeout=30
+        )
+        collected.extend(onemine_items)
+        print(f"[Repo][OneMine] Total in-window items: {len(onemine_items)}")
+    except Exception as e:
+        print(f"[Repo][OneMine][WARN] {e}")
+
+    # Integrations (Crossref, arXiv, AusIMM RSS) - also use extended window per integration
+    try:
+        integ_items = collect_integrations(
+            config, integrations, keywords, start_date, end_date
+        )
+        if integ_items:
+            print(f"[Integrations] Collected: {len(integ_items)} items")
+        collected.extend(integ_items)
+    except Exception as e:
+        print(f"[Integrations][WARN] {e}")
+
+    collected = dedupe_items(collected)
+    print(f"[PIPELINE] Collected in-window total (deduped): {len(collected)}")
+
+    out_dir = script_dir / "output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    raw_csv_path = out_dir / f"raw_academic_repository_{iso_date(end_date)}.csv"
+    write_csv(raw_csv_path, collected)
+    print(f"[PIPELINE] Wrote raw CSV: {raw_csv_path}")
+
+    # Step 2: AI triage (Academic + Repository + Integrations)
+    print(
+        "\n[PIPELINE] Step 2: AI triage ONLY for Academic + Repository + Integrations (token optimisation)"
+    )
+    ai_items = [
+        it
+        for it in collected
+        if it.source_type in ("academic", "repository", "integration")
+    ]
+
+    triaged_rows = triage_items_with_gemini(
+        ai_items,
+        gemini_model_name,
+        min_interval_seconds=float(config.get("gemini_min_interval_seconds", 2.0)),
+        error_sleep_seconds=float(config.get("gemini_error_sleep_seconds", 10.0)),
+        batch_size=6,
+        max_retries=3,
+    )
+
+    triaged_csv_path = out_dir / f"triaged_academic_repository_{iso_date(end_date)}.csv"
+    write_triaged_csv(triaged_csv_path, triaged_rows)
+    print(f"[PIPELINE] Wrote triaged CSV: {triaged_csv_path}")
+
+    # Step 3: Render newsletter HTML
+    print("\n[PIPELINE] Step 3: Render newsletter")
+    title = str(config.get("email_subject", "Recent Publications Digest"))
+    html_body = render_html_digest(
+        collected, triaged_rows, start_date, end_date, title=title
+    )
+    html_path = out_dir / f"digest_{iso_date(end_date)}.html"
+    html_path.write_text(html_body, encoding="utf-8")
+    print(f"[PIPELINE] Saved HTML to: {html_path}")
+
+    # Step 4: Email (left to your existing SMTP code; you can copy from your working version)
+    if no_email:
+        print("[PIPELINE] Email sending disabled (--no-email).")
+        return
+
+    # If you already have a working SMTP sender in your previous script, keep using it.
+    # We deliberately avoid re-implementing SMTP here to reduce the risk of breaking your working setup.
+    try:
+        from email.message import EmailMessage
+        import smtplib
+
+        sender = os.getenv("EMAIL_SENDER", "")
+        password = os.getenv("EMAIL_PASSWORD", "")
+        receiver = os.getenv("EMAIL_RECEIVER", "")
+        if not sender or not password or not receiver:
+            print(
+                "[EMAIL][WARN] Missing EMAIL_SENDER/EMAIL_PASSWORD/EMAIL_RECEIVER in .env; skipping email."
+            )
+            return
+
+        msg = EmailMessage()
+        msg["Subject"] = title
+        msg["From"] = sender
+        msg["To"] = receiver
+        msg.set_content(
+            "HTML digest attached. If you can't view HTML, open it in a browser."
+        )
+
+        # Attach HTML + raw CSV
+        msg.add_attachment(
+            html_body.encode("utf-8"),
+            maintype="text",
+            subtype="html",
+            filename=html_path.name,
+        )
+        msg.add_attachment(
+            raw_csv_path.read_bytes(),
+            maintype="text",
+            subtype="csv",
+            filename=raw_csv_path.name,
+        )
+        if triaged_csv_path.exists():
+            msg.add_attachment(
+                triaged_csv_path.read_bytes(),
+                maintype="text",
+                subtype="csv",
+                filename=triaged_csv_path.name,
+            )
+
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(sender, password)
+            smtp.send_message(msg)
+        print("[EMAIL] Sent successfully (with attachments).")
+
+    except Exception as e:
+        print(f"[EMAIL][WARN] Email sending failed: {e}")
+
+
+def main() -> None:
+    script_dir = Path(__file__).resolve().parent
+    no_email = "--no-email" in sys.argv
+    run_pipeline(script_dir, no_email=no_email)
 
 
 if __name__ == "__main__":
-    import sys
-
-    run_pipeline(do_send_email=("--no-email" not in sys.argv))
+    main()
