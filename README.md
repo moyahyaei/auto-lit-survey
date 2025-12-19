@@ -11,6 +11,24 @@ A lightweight pipeline that:
 
 ---
 
+
+## Choose a version: GPTV4 vs GPTV5-Integrations
+
+This repository includes **two runnable scripts**:
+
+- **`daily_digest_GPTV4.py`** — the stable, minimal baseline (OpenAlex journals + OneMine repositories + optional RSS from `sources.csv`).  
+  Use this if you want the simplest setup and the smallest moving surface.
+
+- **`daily_digest_GPTV5_integrations.py`** — the expanded version. It keeps **the same email + HTML digest structure** as GPTV4, but adds **optional integrations** driven by a second config file (`config_integrations.yaml`), e.g.:
+  - Crossref REST
+  - Semantic Scholar Graph API
+  - arXiv API  
+  (and any future sources you add following the same pattern)
+
+**Important:** GPTV5 integrations are **opt‑in**. If `config_integrations.yaml` is missing (or a source is `enabled: false`), GPTV5 behaves like GPTV4.
+
+---
+
 ## What this produces
 
 Each run writes outputs to `./output/`:
@@ -80,7 +98,10 @@ Copy-Item .env.example .env
 
 ### 4) Run
 ```bash
-python daily_digest.py
+python daily_digest_GPTV4.py
+
+# or, with optional integrations
+python daily_digest_GPTV5_integrations.py
 ```
 
 > If your main file is named differently, run that filename instead.
@@ -159,6 +180,57 @@ Example:
 This is intentional because repository pages often lag or list fewer items in the last week.
 
 ---
+
+
+## Configuration for integrations (`config_integrations.yaml`) — GPTV5 only
+
+If you run **`daily_digest_GPTV5_integrations.py`**, you can optionally add a second config file named **`config_integrations.yaml`**.
+
+Use it to:
+- enable/disable each integration independently (`enabled: true/false`)
+- set **API keys via environment variables** (never commit keys)
+- enforce per-source pacing / rate limits (`min_interval_seconds`)
+- tweak per-source query behaviour (e.g., `max_results_per_query`, `extra_days`, `categories`)
+
+If this file is missing, GPTV5 will **skip all extra integrations** and run with the same core sources as GPTV4.
+
+### Minimal example
+
+```yaml
+project:
+  lookback_days: 7
+  repository_extra_days: 30
+  output_dir: "output"
+
+crossref:
+  enabled: true
+  max_results_per_query: 50
+  min_interval_seconds: 1.0
+  timeout_seconds: 30
+
+semantic_scholar:
+  enabled: false            # turn on when you have a key + are ready to use it
+  api_key_env: "SEMANTIC_SCHOLAR_API_KEY"
+  max_results_per_query: 50
+  # Semantic Scholar enforces ~1 request/second across endpoints.
+  # Keep this >= 1.05 to stay under the limit (the code also enforces a safe floor).
+  min_interval_seconds: 1.1
+
+arxiv:
+  enabled: true
+  categories: ["cs.SY","eess.SY"]
+  max_results_per_query: 50
+```
+
+### Environment variables used by integrations
+
+- `SEMANTIC_SCHOLAR_API_KEY` (Semantic Scholar; sent as header `x-api-key`)
+- `CROSSREF_MAILTO` (recommended; polite usage + better support)
+- `OPENALEX_MAILTO` (recommended; polite usage + better support)
+- `LENS_API_KEY` (Lens; only if you enable Lens integration)
+
+> Tip: keep most integrations **disabled** until you’ve validated one at a time.
+
 
 ## Sources (`sources.csv`)
 
@@ -240,6 +312,17 @@ Rate limits vary by model tier and can change over time.
 ---
 
 ## Running on GitHub Actions (scheduled)
+
+### Selecting the script version in Actions
+
+Your workflow should call **one** of the scripts:
+
+- `python daily_digest_GPTV4.py` (baseline)
+- `python daily_digest_GPTV5_integrations.py` (baseline + optional integrations via `config_integrations.yaml`)
+
+If you choose GPTV5, make sure **both** config files are present in the repo:
+- `config.yaml` (core settings)
+- `config_integrations.yaml` (integration toggles + rate limits; keep sources disabled until tested)
 
 You can run this daily/weekly on GitHub.
 
