@@ -23,6 +23,7 @@ Key improvements incorporated:
 - Uses timezone-aware UTC dates (avoids utcnow deprecation).
 """
 
+import logging
 import os
 import re
 import json
@@ -53,17 +54,45 @@ from dotenv import load_dotenv
 
 import xml.etree.ElementTree as ET
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
+
+# =========================
+# Constants
+# =========================
+
+DEFAULT_TIMEOUT = 30
+MAX_RETRIES = 4
+AI_ERROR_SLEEP_SECONDS_DEFAULT = 10.0
+AI_MIN_INTERVAL_SECONDS_DEFAULT = 2.0
+GEMINI_ERROR_SLEEP_SECONDS_DEFAULT = 10.0
+GEMINI_MIN_INTERVAL_SECONDS_DEFAULT = 2.0
+LOOKBACK_DAYS_DEFAULT = 7
+MAX_ITEMS_PER_FEED_DEFAULT = 5
+AI_BATCH_SIZE_DEFAULT = 6
+AI_SLEEP_SECONDS_DEFAULT = 2.0
+AI_ABSTRACT_MAX_CHARS_DEFAULT = 6000
+TREND_ITEMS_CAP_DEFAULT = 12
+REPOSITORY_EXTRA_DAYS_DEFAULT = 30
+
 # =========================
 # Utilities
 # =========================
 
 
 def utc_today_date() -> dt.date:
+    """Get today's date in UTC timezone."""
     # timezone-aware UTC for forward compatibility
     return dt.datetime.now(dt.timezone.utc).date()
 
 
 def normalize_ws(s: str) -> str:
+    """Normalize whitespace in a string."""
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
@@ -383,21 +412,27 @@ else:
         "[CONFIG] No integrations config found (config_integrations.yaml). Continuing without extra sources."
     )
 
-LOOKBACK_DAYS = int(config.get("lookback_days", 7))
-MAX_ITEMS_PER_FEED = int(config.get("max_items_per_feed", 5))
+LOOKBACK_DAYS = int(config.get("lookback_days", LOOKBACK_DAYS_DEFAULT))
+MAX_ITEMS_PER_FEED = int(config.get("max_items_per_feed", MAX_ITEMS_PER_FEED_DEFAULT))
 EMAIL_SUBJECT = str(config.get("email_subject", "Weekly Mining & Processing Digest"))
 
-AI_BATCH_SIZE = int(config.get("ai_batch_size", 6))
-AI_SLEEP_SECONDS = float(config.get("ai_sleep_seconds", 2.0))
+AI_BATCH_SIZE = int(config.get("ai_batch_size", AI_BATCH_SIZE_DEFAULT))
+AI_SLEEP_SECONDS = float(config.get("ai_sleep_seconds", AI_SLEEP_SECONDS_DEFAULT))
 AI_MIN_INTERVAL_SECONDS = float(
     config.get(
-        "ai_min_interval_seconds", config.get("gemini_min_interval_seconds", 2.0)
+        "ai_min_interval_seconds",
+        config.get("gemini_min_interval_seconds", AI_MIN_INTERVAL_SECONDS_DEFAULT),
     )
 )
 AI_ERROR_SLEEP_SECONDS = float(
-    config.get("ai_error_sleep_seconds", config.get("gemini_error_sleep_seconds", 10.0))
+    config.get(
+        "ai_error_sleep_seconds",
+        config.get("gemini_error_sleep_seconds", AI_ERROR_SLEEP_SECONDS_DEFAULT),
+    )
 )
-REPOSITORY_EXTRA_DAYS = int(config.get("repository_extra_days", 30))
+REPOSITORY_EXTRA_DAYS = int(
+    config.get("repository_extra_days", REPOSITORY_EXTRA_DAYS_DEFAULT)
+)
 
 # Simple global throttling to reduce 429s (rate limits)
 _AI_LAST_CALL_MONO = 0.0
@@ -415,8 +450,10 @@ def ai_throttle():
     _AI_LAST_CALL_MONO = time.monotonic()
 
 
-AI_ABSTRACT_MAX_CHARS = int(config.get("ai_abstract_max_chars", 6000))
-TREND_ITEMS_CAP = int(config.get("trend_items_cap", 12))
+AI_ABSTRACT_MAX_CHARS = int(
+    config.get("ai_abstract_max_chars", AI_ABSTRACT_MAX_CHARS_DEFAULT)
+)
+TREND_ITEMS_CAP = int(config.get("trend_items_cap", TREND_ITEMS_CAP_DEFAULT))
 
 TODAY = utc_today_date()
 START_DATE = TODAY - dt.timedelta(days=LOOKBACK_DAYS)
@@ -636,13 +673,14 @@ def openalex_reconstruct_abstract(inverted_index: Optional[dict]) -> str:
 def fetch_openalex_journal_items(
     sources_df: pd.DataFrame, start: dt.date, end: dt.date
 ) -> List[Item]:
+    """Fetch academic items from OpenAlex journals."""
     out: List[Item] = []
     journals = sources_df[sources_df["type"] == "journal"]["identifier"].tolist()
     if not journals:
-        print("[OpenAlex] No journals configured.")
+        logger.info("[OpenAlex] No journals configured.")
         return out
 
-    print(f"[OpenAlex] Querying journals for {start} -> {end} ...")
+    logger.info(f"[OpenAlex] Querying journals for {start} -> {end} ...")
     for jname in journals:
         jid = openalex_resolve_source_id(jname)
         if not jid:
@@ -664,12 +702,12 @@ def fetch_openalex_journal_items(
             params["mailto"] = OPENALEX_MAILTO
 
         try:
-            r = SESSION.get(base_url, params=params, timeout=45)
+            r = SESSION.get(base_url, params=params, timeout=DEFAULT_TIMEOUT)
             if r.status_code != 200:
-                print(f"[OpenAlex] {jname}: HTTP {r.status_code}")
+                logger.error(f"[OpenAlex] {jname}: HTTP {r.status_code}")
                 continue
             results = (r.json() or {}).get("results", []) or []
-            print(f"[OpenAlex] {jname}: fetched {len(results)} candidates")
+            logger.info(f"[OpenAlex] {jname}: fetched {len(results)} candidates")
 
             for w in results:
                 pub = parse_date_flexible(w.get("publication_date", ""))
@@ -704,9 +742,12 @@ def fetch_openalex_journal_items(
                 )
             time.sleep(0.2)
         except Exception as e:
-            print(f"[OpenAlex] {jname}: error {e}")
+            logger.error(f"[OpenAlex] {jname}: error {e}")
 
-    print(f"[OpenAlex] Total in-window items (pre-dedupe): {len(out)}")
+    logger.info(f"[OpenAlex] Total in-window items (pre-dedupe): {len(out)}")
+    logger.info(
+        f"[WATCHDOG] OpenAlex sample items: {[it.title[:50] + '...' for it in out[:3]] if out else 'None'}"
+    )
     return out
 
 
@@ -735,20 +776,21 @@ def parse_rss_entry_date(entry) -> Optional[dt.date]:
 def fetch_rss_items(
     sources_df: pd.DataFrame, start: dt.date, end: dt.date
 ) -> List[Item]:
+    """Fetch news items from RSS feeds."""
     out: List[Item] = []
     rss_df = sources_df[sources_df["type"] == "rss"]
     if rss_df.empty:
-        print("[RSS] No rss sources configured.")
+        logger.info("[RSS] No rss sources configured.")
         return out
 
-    print(f"[RSS] Fetching RSS for {start} -> {end} ...")
+    logger.info(f"[RSS] Fetching RSS for {start} -> {end} ...")
     for _, row in rss_df.iterrows():
         name = row["name"].strip()
         rss_url = row["identifier"].strip()
         try:
-            resp = SESSION.get(rss_url, timeout=30)
+            resp = SESSION.get(rss_url, timeout=DEFAULT_TIMEOUT)
             if resp.status_code != 200:
-                print(f"[RSS] {name}: HTTP {resp.status_code}")
+                logger.error(f"[RSS] {name}: HTTP {resp.status_code}")
                 continue
 
             feed = feedparser.parse(resp.content)
@@ -780,11 +822,14 @@ def fetch_rss_items(
                 if kept >= MAX_ITEMS_PER_FEED:
                     break
 
-            print(f"[RSS] {name}: kept {kept} in-window items")
+            logger.info(f"[RSS] {name}: kept {kept} in-window items")
         except Exception as e:
-            print(f"[RSS] {name}: error {e}")
+            logger.error(f"[RSS] {name}: error {e}")
 
-    print(f"[RSS] Total in-window items (pre-dedupe): {len(out)}")
+    logger.info(f"[RSS] Total in-window items (pre-dedupe): {len(out)}")
+    logger.info(
+        f"[WATCHDOG] RSS sample items: {[it.title[:50] + '...' for it in out[:3]] if out else 'None'}"
+    )
     return out
 
 
@@ -921,10 +966,11 @@ def fetch_onemine_repository_items(
     max_pages: int = 3,
     page_size: int = 20,
 ) -> List[Item]:
+    """Fetch repository items from OneMine."""
     out: List[Item] = []
     repo_df = sources_df[sources_df["type"] == "repository"]
     if repo_df.empty:
-        print("[Repo] No repository sources configured.")
+        logger.info("[Repo] No repository sources configured.")
         return out
 
     onemine_rows = []
@@ -935,10 +981,10 @@ def fetch_onemine_repository_items(
             onemine_rows.append(row)
 
     if not onemine_rows:
-        print("[Repo] No OneMine repository entries found.")
+        logger.info("[Repo] No OneMine repository entries found.")
         return out
 
-    print(f"[Repo][OneMine] Fetching OneMine for {start} -> {end} ...")
+    logger.info(f"[Repo][OneMine] Fetching OneMine for {start} -> {end} ...")
     base_url = "https://www.onemine.org/search"
 
     for row in onemine_rows:
@@ -962,15 +1008,17 @@ def fetch_onemine_repository_items(
                     "DateTo": end.isoformat(),
                 }
             )
-            print(f"[Repo][OneMine] GET {name}: page={page} params={params}")
+            logger.info(f"[Repo][OneMine] GET {name}: page={page} params={params}")
 
-            r = SESSION.get(base_url, params=params, timeout=45)
+            r = SESSION.get(base_url, params=params, timeout=DEFAULT_TIMEOUT)
             if r.status_code != 200:
-                print(f"[Repo][OneMine] {name}: HTTP {r.status_code} on page {page}")
+                logger.error(
+                    f"[Repo][OneMine] {name}: HTTP {r.status_code} on page {page}"
+                )
                 break
 
             parsed = onemine_parse_list_page(r.text)
-            print(
+            logger.info(
                 f"[Repo][OneMine] {name}: parsed {len(parsed)} list items on page {page}"
             )
             if not parsed:
@@ -987,7 +1035,7 @@ def fetch_onemine_repository_items(
                 break
 
         if newest_seen and newest_seen < start:
-            print(
+            logger.warning(
                 f"[Repo][OneMine][NOTE] {name}: newest item seen is {newest_seen} < START_DATE={start}. Expect 0 in-window results."
             )
 
@@ -1025,9 +1073,12 @@ def fetch_onemine_repository_items(
             )
             kept += 1
 
-        print(f"[Repo][OneMine] {name}: kept {kept} in-window items")
+        logger.info(f"[Repo][OneMine] {name}: kept {kept} in-window items")
 
-    print(f"[Repo][OneMine] Total in-window items (pre-dedupe): {len(out)}")
+    logger.info(f"[Repo][OneMine] Total in-window items (pre-dedupe): {len(out)}")
+    logger.info(
+        f"[WATCHDOG] OneMine sample items: {[it.title[:50] + '...' for it in out[:3]] if out else 'None'}"
+    )
     return out
 
 
@@ -1145,6 +1196,10 @@ def fetch_crossref_keyword_items(
                 )
             )
 
+    logger.info(f"[Crossref] Total items collected: {len(out)}")
+    logger.info(
+        f"[WATCHDOG] Crossref sample items: {[it.title[:50] + '...' for it in out[:3]] if out else 'None'}"
+    )
     return out
 
 
@@ -1344,6 +1399,10 @@ def fetch_semantic_scholar_keyword_items(
                 )
             )
 
+    logger.info(f"[Semantic Scholar] Total items collected: {len(out)}")
+    logger.info(
+        f"[WATCHDOG] Semantic Scholar sample items: {[it.title[:50] + '...' for it in out[:3]] if out else 'None'}"
+    )
     return out
 
 
@@ -1451,6 +1510,10 @@ def fetch_arxiv_keyword_items(
                 )
             )
 
+    logger.info(f"[arXiv] Total items collected: {len(out)}")
+    logger.info(
+        f"[WATCHDOG] arXiv sample items: {[it.title[:50] + '...' for it in out[:3]] if out else 'None'}"
+    )
     return out
 
 
@@ -1460,6 +1523,7 @@ def fetch_arxiv_keyword_items(
 
 
 def dedupe_items(items: List[Item]) -> List[Item]:
+    """Deduplicate items based on URL, DOI, or title+date hash."""
     seen = set()
     out = []
     for it in items:
@@ -1477,6 +1541,7 @@ def dedupe_items(items: List[Item]) -> List[Item]:
             continue
         seen.add(key)
         out.append(it)
+    logger.info(f"[Dedupe] Input: {len(items)}, Output: {len(out)}")
     return out
 
 
@@ -1948,6 +2013,8 @@ def run_pipeline(
     sources_csv: str = "sources.csv",
     do_send_email: bool = True,
 ) -> None:
+    """Run the full literature survey pipeline."""
+    logger.info("[PIPELINE] Starting literature survey pipeline")
     keywords_path = os.path.join(SCRIPT_DIR, keywords_csv)
     sources_path = os.path.join(SCRIPT_DIR, sources_csv)
     if not os.path.exists(keywords_path):
@@ -1956,9 +2023,11 @@ def run_pipeline(
         raise FileNotFoundError(f"Missing {sources_path}")
 
     keywords_context = load_keywords_csv(keywords_path)
+    logger.info(f"[WATCHDOG] Loaded keywords: {len(keywords_context)} topics")
     sources_df = load_sources_csv(sources_path)
+    logger.info(f"[WATCHDOG] Loaded sources: {len(sources_df)} entries")
 
-    print("\n[PIPELINE] Step 1: Collect items (OpenAlex + RSS + OneMine)")
+    logger.info("[PIPELINE] Step 1: Collect items (OpenAlex + RSS + OneMine)")
     collected: List[Item] = []
     collected.extend(fetch_openalex_journal_items(sources_df, START_DATE, END_DATE))
     collected.extend(fetch_rss_items(sources_df, START_DATE, END_DATE))
@@ -1973,7 +2042,7 @@ def run_pipeline(
         # Log enabled integrations (for debugging)
         for _name in ["crossref", "semantic_scholar", "arxiv"]:
             if _integration_enabled(integrations_config, _name):
-                print(
+                logger.info(
                     f"[Integrations] {_name} enabled. Window: {START_DATE} -> {END_DATE}."
                 )
         # NOTE: AusIMM RSS/feed mode intentionally removed (no RSS available)
@@ -1982,47 +2051,58 @@ def run_pipeline(
                 integrations_config, START_DATE, END_DATE, keywords_context
             )
         )
-        collected.extend(
-            fetch_semantic_scholar_keyword_items(
-                integrations_config, START_DATE, END_DATE, keywords_context
-            )
+        # Semantic Scholar: confirm API key presence (masked)
+        _ss_cfg = _integration_cfg(integrations_config, "semantic_scholar")
+        _ss_env = str(_ss_cfg.get("api_key_env") or "SEMANTIC_SCHOLAR_API_KEY")
+        _ss_key_present = bool(os.getenv(_ss_env))
+        logger.info(f"[Semantic Scholar] Key present: {_ss_key_present}")
+        _ss_items = fetch_semantic_scholar_keyword_items(
+            integrations_config, START_DATE, END_DATE, keywords_context
         )
-        collected.extend(
-            fetch_arxiv_keyword_items(
-                integrations_config, START_DATE, END_DATE, keywords_context
-            )
+        logger.info(f"[Semantic Scholar] collected: {len(_ss_items)}")
+        collected.extend(_ss_items)
+        _arxiv_items = fetch_arxiv_keyword_items(
+            integrations_config, START_DATE, END_DATE, keywords_context
         )
+        logger.info(f"[arXiv] collected: {len(_arxiv_items)}")
+        collected.extend(_arxiv_items)
     collected = dedupe_items(collected)
-    print(f"[PIPELINE] Collected total (deduped): {len(collected)}")
+    logger.info(f"[PIPELINE] Collected total (deduped): {len(collected)}")
+    logger.info(
+        f"[WATCHDOG] Sample collected items: {collected[:3] if collected else 'None'}"
+    )
 
     # AI only for Academic + Repository
     ai_items = [it for it in collected if it.source_type in {"Academic", "Repository"}]
+    logger.info(
+        f"[WATCHDOG] AI triage items: {len(ai_items)} (Academic + Repository only)"
+    )
 
     out_dir = os.path.join(SCRIPT_DIR, "output")
     os.makedirs(out_dir, exist_ok=True)
 
     raw_path = os.path.join(out_dir, f"raw_academic_repository_{TODAY}.csv")
     write_csv(items_to_dataframe(ai_items), raw_path)
-    print(f"[PIPELINE] Wrote raw CSV: {raw_path}")
+    logger.info(f"[PIPELINE] Wrote raw CSV: {raw_path}")
 
-    print(
-        "\n[PIPELINE] Step 2: AI triage ONLY for Academic + Repository (token optimisation)"
+    logger.info(
+        "[PIPELINE] Step 2: AI triage ONLY for Academic + Repository (token optimisation)"
     )
     triaged = ai_triage_items_batched(ai_items, keywords_context)
 
     triaged_path = os.path.join(out_dir, f"triaged_academic_repository_{TODAY}.csv")
     write_csv(items_to_dataframe(triaged), triaged_path)
-    print(f"[PIPELINE] Wrote triaged CSV: {triaged_path}")
+    logger.info(f"[PIPELINE] Wrote triaged CSV: {triaged_path}")
 
-    print("\n[PIPELINE] Step 3: Build deterministic source overviews")
+    logger.info("[PIPELINE] Step 3: Build deterministic source overviews")
     overviews = build_source_overviews(triaged)
 
-    print("\n[PIPELINE] Step 3b: AI trend paragraph per source (capped)")
+    logger.info("[PIPELINE] Step 3b: AI trend paragraph per source (capped)")
     trend_notes = ai_trend_paragraphs_per_source(
         triaged, max_items_per_source=TREND_ITEMS_CAP
     )
 
-    print("\n[PIPELINE] Step 4: Render newsletter")
+    logger.info("[PIPELINE] Step 4: Render newsletter")
     collected_counts = Counter([i.source for i in triaged])
     attachment_paths = [raw_path, triaged_path]
     attachment_names = [os.path.basename(p) for p in attachment_paths]
@@ -2042,13 +2122,13 @@ def run_pipeline(
     out_html = os.path.join(out_dir, f"digest_{TODAY}.html")
     with open(out_html, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"[PIPELINE] Saved HTML to: {out_html}")
+    logger.info(f"[PIPELINE] Saved HTML to: {out_html}")
 
-    print("\n[PIPELINE] Step 5: Send email (with attachments)")
+    logger.info("[PIPELINE] Step 5: Send email (with attachments)")
     if do_send_email:
         send_email(html, attachments=[out_html] + attachment_paths)
     else:
-        print("[PIPELINE] Email sending disabled (do_send_email=False).")
+        logger.info("[PIPELINE] Email sending disabled (do_send_email=False).")
 
 
 if __name__ == "__main__":
