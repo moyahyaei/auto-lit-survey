@@ -30,7 +30,8 @@ jobs:
           EMAIL_SENDER:   ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-        run: python daily_digest_GPTV4.py
+        # run: python daily_digest_GPTV4.py    #This is the ligher version
+        run: daily_digest_GPTV5_integrations.py #This is the full version with integrations
 
       - name: Upload newsletter HTML as artifact
         if: always()
